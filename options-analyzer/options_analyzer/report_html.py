@@ -7,8 +7,9 @@ import numpy as np
 
 from . import calendar_us as cal
 from .analysis import AnalysisResult
+from .chain import oi_available
 from .contracts import ContractEval
-from .fmt import DISCLAIMER, STATUS_TH, money, num, ok, pct, vol_points
+from .fmt import DISCLAIMER, STATUS_TH, earnings_note, money, num, ok, pct, vol_points
 from .validation import FAIL, PASS, WARN
 from .weekly import FEATURE_LABELS, LEAN_LABELS
 
@@ -278,12 +279,16 @@ def _options_html(res: AnalysisResult) -> str:
     earn = res.earnings
     if earn is not None:
         val = "ไม่มี (ETF)" if earn.status == "none" else (str(earn.upcoming[0]) if earn.upcoming else "ยืนยันไม่ได้")
-        moves = ""
+        moves = earnings_note(earn.confirmed) + ". " if earn.upcoming else ""
         if res.earnings_moves:
             avg = sum(abs(m) for _, m in res.earnings_moves) / len(res.earnings_moves)
-            moves = f"หลังงบ {len(res.earnings_moves)} ครั้งล่าสุด เคลื่อนไหวเฉลี่ย ±{pct(avg)}"
+            moves += f"หลังงบ {len(res.earnings_moves)} ครั้งล่าสุด เคลื่อนไหวเฉลี่ย ±{pct(avg)}"
         cards.append(_stat("ประกาศงบครั้งถัดไป", val, moves))
-    return (f"<h2>4. ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / {e.sessions} วันทำการ)</h2>"
+    closed = ""
+    if res.valuation_time is not None and res.valuation_time != res.generated_at:
+        closed = (f'<p class="note">ตลาดปิดอยู่: ราคาหุ้นและออปชั่นเป็นราคา ณ ปิดตลาด '
+                  f"{res.valuation_time:%Y-%m-%d %H:%M} ET และคำนวณเวลาถึงวันหมดอายุจากจุดนั้น</p>")
+    return (f"<h2>4. ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / เหลือ {e.sessions} วันทำการ)</h2>{closed}"
             f'<div class="grid">{"".join(cards)}</div>')
 
 
@@ -291,6 +296,7 @@ def _cands_html(res: AnalysisResult) -> str:
     if not res.candidates:
         return ""
     rows = []
+    has_oi = res.chain is not None and oi_available(res.chain)
     for ev in res.candidates:
         n_fail = sum(c.status == FAIL for c in ev.criteria)
         lvl_cls = "good" if ev.risk_level == "ต่ำ" else "warn" if ev.risk_level == "ปานกลาง" else "bad"
@@ -299,7 +305,7 @@ def _cands_html(res: AnalysisResult) -> str:
             f"<td>{pct(ev.spread_pct)}</td><td>{pct(ev.iv)}</td><td>{ev.delta:+.2f}</td>"
             f"<td>{num(ev.breakeven)} ({pct(ev.breakeven_move, 1, True)})</td><td>{pct(ev.prob_profit)}</td>"
             f"<td>{pct(ev.prob_profit_hist.prob)}</td><td>{pct(1 - ev.prob_itm)}</td><td>{pct(ev.theta_pct)}</td>"
-            f"<td>{ev.oi:,.0f}</td><td class=\"{lvl_cls}\"><b>{_e(ev.risk_level)}</b> ({ev.risk_score:.0f}, "
+            f"<td>{f'{ev.oi:,.0f}' if has_oi else 'n/a'}</td><td class=\"{lvl_cls}\"><b>{_e(ev.risk_level)}</b> ({ev.risk_score:.0f}, "
             f"ไม่ผ่าน {n_fail})</td></tr>")
     return ('<h2>5. สัญญาใกล้ ATM (ประเมินสำหรับฝั่งผู้ซื้อ)</h2><div class="card scroll"><table><tr>'
             '<th class="l">ประเภท</th><th>Strike</th><th>ราคา</th><th>Spread</th><th>IV</th><th>Delta</th>'

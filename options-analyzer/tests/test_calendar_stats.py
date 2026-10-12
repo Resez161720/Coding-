@@ -95,3 +95,13 @@ def test_empirical_prob_matches_manual_count():
     assert res.n == len(manual) == 1000
     assert res.prob == pytest.approx((manual > thr).mean())
     assert res.ci_low <= res.prob <= res.ci_high
+
+
+def test_valuation_time_uses_last_close_when_market_is_closed():
+    ny = cal.NY
+    open_now = dt.datetime(2026, 10, 12, 11, 0, tzinfo=ny)
+    assert cal.valuation_time(open_now) == open_now
+    friday_close = dt.datetime(2026, 10, 9, 16, 0, tzinfo=ny)
+    assert cal.valuation_time(dt.datetime(2026, 10, 12, 1, 53, tzinfo=ny)) == friday_close  # Monday pre-open
+    assert cal.valuation_time(dt.datetime(2026, 10, 10, 12, 0, tzinfo=ny)) == friday_close  # Saturday
+    assert cal.valuation_time(dt.datetime(2026, 10, 12, 18, 0, tzinfo=ny)) == dt.datetime(2026, 10, 12, 16, 0, tzinfo=ny)

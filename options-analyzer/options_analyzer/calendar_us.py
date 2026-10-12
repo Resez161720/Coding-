@@ -124,3 +124,15 @@ def stamp(t: dt.datetime) -> str:
     """'2026-10-12 11:00 (นิวยอร์ก) / 22:00 (ไทย)'."""
     th = t.astimezone(BANGKOK)
     return f"{t:%Y-%m-%d %H:%M} (นิวยอร์ก) / {th:%Y-%m-%d %H:%M} (ไทย)"
+
+
+def valuation_time(now: dt.datetime) -> dt.datetime:
+    """The moment market prices refer to.
+
+    While the market is open this is `now`. Otherwise stock and option prices are
+    the last session's closing prices, so time to expiry must be measured from that
+    close: measuring from `now` would shrink T over a weekend and overstate IV.
+    """
+    if market_is_open(now):
+        return now
+    return dt.datetime.combine(last_session_with_data(now), MARKET_CLOSE, tzinfo=NY)

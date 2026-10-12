@@ -95,7 +95,17 @@ def _fake_yf(provider: FakeProvider):
             }
             self.options = tuple(provider.expiries)
             self.info = {"longName": "Yahoo Shape Corp", "quoteType": "EQUITY"}
-            self.calendar = {"Earnings Date": [dt.date(2026, 11, 11)]}
+            self.calendar = {"Earnings Date": [dt.date(2026, 11, 12)]}  # deliberately different: raw wins
+            ts = int(dt.datetime(2026, 11, 11, 16, 30, tzinfo=cal.NY).timestamp())
+
+            class _Quote:
+                @staticmethod
+                def _fetch(modules):
+                    assert modules == ["calendarEvents"]
+                    return {"quoteSummary": {"result": [{"calendarEvents": {"earnings": {
+                        "earningsDate": [ts], "isEarningsDateEstimate": False}}}]}}
+
+            self._quote = _Quote()
             self.dividends = pd.Series([0.25, 0.25], index=pd.DatetimeIndex(
                 ["2026-03-10", "2026-09-10"]).tz_localize(cal.NY))
 
@@ -144,6 +154,7 @@ def test_yahoo_provider_parsing(monkeypatch):
     assert r == pytest.approx(0.044) and "^IRX" in src
     e = yp.earnings("TEST")
     assert e.status == "known" and e.upcoming == [dt.date(2026, 11, 11)] and e.past == [dt.date(2026, 7, 30)]
+    assert e.confirmed is True
     d = yp.dividends("TEST")
     assert d.sum() == pytest.approx(0.5)
 
@@ -174,3 +185,38 @@ def test_cli_writes_reports(tmp_path, monkeypatch, capsys):
 def test_cli_rejects_both_call_and_put(monkeypatch):
     monkeypatch.setattr("options_analyzer.cli._provider", lambda: FakeProvider())
     assert main(["TEST", "--call", "30", "--put", "30", "--no-html"]) == 2
+
+
+MONDAY_PRE_OPEN = dt.datetime(2026, 10, 12, 1, 53, tzinfo=cal.NY)
+
+
+def test_off_hours_chain_is_valued_at_the_last_close():
+    # Weekend data: no bid/ask, no OI, last trades just before Friday's close.
+    from conftest import gbm_history
+    p = FakeProvider(hist=gbm_history(end=dt.date(2026, 10, 9)), now=MONDAY_PRE_OPEN, off_hours=True)
+    res = analyze("TEST", p, now=MONDAY_PRE_OPEN, focus=("call", round(p.spot)))
+    assert res.errors == [], res.errors
+    assert res.valuation_time == dt.datetime(2026, 10, 9, 16, 0, tzinfo=cal.NY)
+    # IV must come back at the vol the chain was priced with, not inflated by the weekend.
+    assert res.selected.atm_iv == pytest.approx(p.sigma, abs=0.01)
+    assert res.selected.sessions == 5  # Mon..Fri still ahead
+    names = {c.name: c.status for c in res.validation.checks}
+    assert names["Open Interest"] == "WARN"
+    assert names["ราคาเสนอซื้อ/ขาย"] == "WARN"
+    assert names["Put-Call Parity"] == "PASS"
+    assert math.isnan(res.selected.put_call_oi)
+    crit = {c.name: c.status for c in res.focus.criteria}
+    assert crit["Open Interest"] == "WARN"  # unknown, not "fails"
+
+
+def test_stale_last_trades_are_not_priced():
+    from conftest import gbm_history
+    p = FakeProvider(hist=gbm_history(end=dt.date(2026, 10, 9)), now=MONDAY_PRE_OPEN, off_hours=True)
+    exp = p.expiries[1]
+    calls, puts, uq = p.chain("X", exp)
+    calls.loc[calls.index[:5], "lastTradeDate"] = pd.Timestamp("2026-10-09 15:00", tz="UTC")  # 11:00 ET
+    T = cal.years_to_expiry(p.price_time, dt.date.fromisoformat(exp))
+    from options_analyzer.chain import build_chain
+    ch = build_chain(calls, puts, p.spot, T, p.r, 0.0, dt.date(2026, 10, 9))
+    stale = ch[(ch["kind"] == "call") & ch["strike"].isin(calls["strike"].iloc[:5])]
+    assert (stale["price_source"] == "none").all()

@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from . import calendar_us as cal
-from .chain import atm_iv, atm_straddle, build_chain, implied_prob_above
+from .chain import atm_iv, atm_straddle, build_chain, implied_prob_above, oi_available
 from .contracts import Context, ContractEval, evaluate, find_contract, pick_candidates, sanity_errors
 from .data import EarningsInfo, Provider, Quote
 from .pricing import expected_move
@@ -91,6 +91,7 @@ class AnalysisResult:
     focus: ContractEval | None = None
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    valuation_time: dt.datetime | None = None  # moment the option prices refer to
 
     @property
     def options_ok(self) -> bool:
@@ -322,10 +323,12 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
         return res
 
     last_session = cal.last_session_with_data(now)
+    val = cal.valuation_time(now)
+    res.valuation_time = val
     to_fetch = [chosen] + [e for e in res.expirations if e != chosen and dt.date.fromisoformat(e) > today][:term_n]
     for e in to_fetch:
         e_date = dt.date.fromisoformat(e)
-        T = cal.years_to_expiry(now, e_date)
+        T = cal.years_to_expiry(val, e_date)
         try:
             calls, puts, uq = provider.chain(ticker, e)
         except Exception as ex:
@@ -347,8 +350,8 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
             if crep.failed():
                 res.errors.append("ข้อมูลออปชั่นไม่ผ่านการตรวจสอบ — ไม่แสดงการประเมินสัญญาเพื่อป้องกันข้อมูลผิดพลาด")
                 return res
-            _fill_expiry(res, ch, chain_spot, e_date, T, today, close, r)
-            _evaluate_contracts(res, ch, chain_spot, e_date, T, today, close, r, q, focus, per_side)
+            _fill_expiry(res, ch, chain_spot, e_date, T, today, val.date(), close, r)
+            _evaluate_contracts(res, ch, chain_spot, e_date, T, today, val.date(), close, r, q, focus, per_side)
         elif crep.failed():
             res.notes.append(f"ไม่แสดง IV ของวันหมดอายุ {e} ใน term structure เพราะข้อมูลไม่ผ่านการตรวจสอบ")
             continue
@@ -360,8 +363,8 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
 
 
 def _fill_expiry(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.date, T: float,
-                 today: dt.date, close: pd.Series, r: float) -> None:
-    sessions = max(cal.trading_days_between(today, e_date), 1)
+                 today: dt.date, val_date: dt.date, close: pd.Series, r: float) -> None:
+    sessions = max(cal.trading_days_between(val_date, e_date), 1)
     iv = atm_iv(ch, spot)
     st = atm_straddle(ch, spot)
     hist_p, hist_n = float("nan"), 0
@@ -370,7 +373,7 @@ def _fill_expiry(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.
         hist_n = len(rets)
         if hist_n:
             hist_p = float((np.abs(np.expm1(rets)) > st[1] / spot).mean())
-    oi = ch.groupby("kind")["oi"].sum()
+    oi = ch.groupby("kind")["oi"].sum() if oi_available(ch) else pd.Series(dtype=float)
     vol = ch.groupby("kind")["volume"].sum()
     res.selected = ExpiryInfo(
         expiry=e_date, dte=(e_date - today).days, sessions=sessions, T=T, spot=spot, atm_iv=iv,
@@ -385,7 +388,7 @@ def _fill_expiry(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.
 
 
 def _evaluate_contracts(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.date, T: float,
-                        today: dt.date, close: pd.Series, r: float, q: float,
+                        today: dt.date, val_date: dt.date, close: pd.Series, r: float, q: float,
                         focus: tuple[str, float] | None, per_side: int) -> None:
     st = res.stock
     sma50 = st.sma50 if math.isfinite(st.sma50) else None
@@ -393,7 +396,7 @@ def _evaluate_contracts(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_da
     earn = res.earnings or EarningsInfo("unknown")
     ctx = Context(
         spot=spot, r=r, q=q, T=T, expiry=e_date, today=today,
-        sessions=max(cal.trading_days_between(today, e_date), 1), close=close,
+        sessions=max(cal.trading_days_between(val_date, e_date), 1), close=close, oi_available=oi_available(ch),
         hv20=st.hv20, hv60=st.hv60, earnings_status=earn.status, earnings_dates=earn.upcoming,
         above_sma50=None if sma50 is None else spot > sma50,
         above_sma200=None if sma200 is None else spot > sma200,

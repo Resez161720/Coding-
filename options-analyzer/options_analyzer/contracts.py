@@ -41,6 +41,7 @@ class Context:
     above_sma50: bool | None
     above_sma200: bool | None
     lean: str
+    oi_available: bool = True
 
 
 @dataclass
@@ -163,8 +164,12 @@ def _criteria(ev: ContractEval, ctx: Context, sign: int) -> list[Criterion]:
     else:
         c.append(Criterion("สภาพคล่อง (Bid-Ask spread)", WARN, "ไม่มี bid/ask ขณะนี้",
                            "ใช้ราคาซื้อขายล่าสุดแทน — ตรวจ spread จริงก่อนส่งคำสั่ง", 2))
-    c.append(Criterion("Open Interest", _grade(ev.oi, 500, 100, True), f"{ev.oi:,.0f} สัญญา",
-                       "≥500 ดี, ≥100 พอใช้, <100 สภาพคล่องต่ำ", 1))
+    if ctx.oi_available:
+        c.append(Criterion("Open Interest", _grade(ev.oi, 500, 100, True), f"{ev.oi:,.0f} สัญญา",
+                           "≥500 ดี, ≥100 พอใช้, <100 สภาพคล่องต่ำ", 1))
+    else:
+        c.append(Criterion("Open Interest", WARN, "แหล่งข้อมูลไม่มี OI ขณะนี้ (นอกเวลาตลาด)",
+                           "ตรวจ OI ในแอปโบรกเกอร์: ≥500 ดี, ≥100 พอใช้, <100 สภาพคล่องต่ำ", 1))
     c.append(Criterion("โอกาสกำไร ณ วันหมดอายุ (ตาม IV)", _grade(ev.prob_profit, 0.40, 0.25, True),
                        f"{ev.prob_profit:.1%}", "≥40% ดี, ≥25% พอรับได้, <25% ต่ำ", 3))
     hp = ev.prob_profit_hist

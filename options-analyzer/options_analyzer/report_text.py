@@ -4,7 +4,7 @@ from __future__ import annotations
 from . import calendar_us as cal
 from .analysis import AnalysisResult
 from .contracts import ContractEval
-from .fmt import DISCLAIMER, STATUS_TH, money, num, ok, pct, vol_points
+from .fmt import DISCLAIMER, STATUS_TH, earnings_note, money, num, ok, pct, vol_points
 from .validation import FAIL, PASS, WARN
 from .weekly import FEATURE_LABELS, LEAN_LABELS
 
@@ -91,7 +91,10 @@ def _options(res: AnalysisResult) -> list[str]:
     if e is None:
         return []
     s = res.stock
-    out = [f"[4] ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / {e.sessions} วันทำการ)"]
+    out = [f"[4] ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / เหลือ {e.sessions} วันทำการ)"]
+    if res.valuation_time is not None and res.valuation_time != res.generated_at:
+        out.append(f"    ตลาดปิดอยู่: ราคาหุ้นและออปชั่นเป็นราคา ณ ปิดตลาด {res.valuation_time:%Y-%m-%d %H:%M} ET "
+                   "และคำนวณเวลาถึงวันหมดอายุจากจุดนั้น")
     em = e.expected_move_iv
     out.append(f"    ATM IV {pct(e.atm_iv)} | IV ÷ HV20 = {num(e.atm_iv / s.hv20 if ok(s.hv20) and s.hv20 else float('nan'))} "
                f"| Skew 25Δ (Put−Call) {vol_points(e.skew_25d)}")
@@ -115,7 +118,7 @@ def _options(res: AnalysisResult) -> list[str]:
         if earn.status == "none":
             out.append("    งบการเงิน: ไม่มี (ETF/ดัชนี)")
         elif earn.upcoming:
-            out.append(f"    ประกาศงบครั้งถัดไป: {earn.upcoming[0]}")
+            out.append(f"    ประกาศงบครั้งถัดไป: {earn.upcoming[0]} ({earnings_note(earn.confirmed)})")
         else:
             out.append("    ประกาศงบครั้งถัดไป: ยืนยันไม่ได้ — โปรดตรวจสอบเองก่อนซื้อ")
     if res.earnings_moves:

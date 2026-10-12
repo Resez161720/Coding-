@@ -27,6 +27,7 @@ class EarningsInfo:
     status: str  # "known", "none" (ETF/index), "unknown"
     upcoming: list[dt.date] = field(default_factory=list)
     past: list[dt.date] = field(default_factory=list)
+    confirmed: bool | None = None  # False = provider marks the next date as an estimate
 
 
 class Provider(Protocol):
@@ -153,6 +154,20 @@ class YahooProvider:
         upcoming: set[dt.date] = set()
         past: set[dt.date] = set()
         today = cal.now_ny().date()
+        confirmed = None
+        try:
+            # Raw calendarEvents carries exact timestamps and Yahoo's "is estimate" flag, which
+            # yfinance's .calendar drops (and converts in the local time zone, which can shift the date).
+            raw = self._t(symbol)._quote._fetch(modules=["calendarEvents"])
+            earn = raw["quoteSummary"]["result"][0]["calendarEvents"].get("earnings") or {}
+            for ts in earn.get("earningsDate") or []:
+                t = _ts_to_ny(ts)
+                if t is not None and t.date() >= today:
+                    upcoming.add(t.date())
+            if "isEarningsDateEstimate" in earn:
+                confirmed = not bool(earn["isEarningsDateEstimate"])
+        except Exception:
+            pass
         try:
             ed = self._t(symbol).get_earnings_dates(limit=16)
             if ed is not None and len(ed):
@@ -161,18 +176,20 @@ class YahooProvider:
                     (upcoming if d >= today else past).add(d)
         except Exception:
             pass
-        try:
-            calendar = self._t(symbol).calendar or {}
-            for d in calendar.get("Earnings Date", []) or []:
-                if isinstance(d, dt.datetime):
-                    d = d.date()
-                if isinstance(d, dt.date) and d >= today:
-                    upcoming.add(d)
-        except Exception:
-            pass
+        if not upcoming:
+            try:
+                calendar = self._t(symbol).calendar or {}
+                for d in calendar.get("Earnings Date", []) or []:
+                    if isinstance(d, dt.datetime):
+                        d = d.date()
+                    if isinstance(d, dt.date) and d >= today:
+                        upcoming.add(d)
+            except Exception:
+                pass
         if not upcoming and not past:
             return EarningsInfo("unknown")
-        return EarningsInfo("known" if upcoming else "unknown", sorted(upcoming), sorted(past))
+        return EarningsInfo("known" if upcoming else "unknown", sorted(upcoming), sorted(past),
+                            confirmed if upcoming else None)
 
     def dividends(self, symbol: str) -> pd.Series:
         try:

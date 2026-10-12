@@ -58,7 +58,7 @@ class FakeProvider:
 
     def __init__(self, hist: pd.DataFrame | None = None, sigma_chain: float = 0.32, r: float = 0.045,
                  now: dt.datetime = NOW, earnings: EarningsInfo | None = None, spread: float = 0.03,
-                 market: pd.DataFrame | None = None):
+                 market: pd.DataFrame | None = None, off_hours: bool = False):
         self.hist = gbm_history() if hist is None else hist
         self.market = gbm_history(seed=11, sigma=0.18) if market is None else market
         self.sigma = sigma_chain
@@ -69,6 +69,9 @@ class FakeProvider:
             "known", [now.date() + dt.timedelta(days=30)], [now.date() - dt.timedelta(days=60)])
         self.expiries = [f"{d:%Y-%m-%d}" for d in fridays_after(now.date(), 6)]
         self.chain_overrides = {}
+        # Off hours, Yahoo returns bid/ask/OI = 0 and the chain reflects the last session's close.
+        self.off_hours = off_hours
+        self.price_time = cal.valuation_time(now)
 
     @property
     def spot(self) -> float:
@@ -95,7 +98,7 @@ class FakeProvider:
         if expiry in self.chain_overrides:
             return self.chain_overrides[expiry]
         S = self.spot
-        T = cal.years_to_expiry(self.now, dt.date.fromisoformat(expiry))
+        T = cal.years_to_expiry(self.price_time, dt.date.fromisoformat(expiry))
         strikes = np.arange(round(S * 0.7), round(S * 1.3) + 1, 1.0)
         sides = {}
         for kind in ("call", "put"):
@@ -105,10 +108,13 @@ class FakeProvider:
                 p = bs_price(S, K, T, self.r, iv, kind)
                 bid = max(round(p * (1 - self.spread) - 0.01, 2), 0.0)
                 ask = round(p * (1 + self.spread) + 0.01, 2)
+                traded = self.price_time - dt.timedelta(minutes=2) if self.off_hours else self.now
                 rows.append({
-                    "contractSymbol": f"FAKE{expiry}{kind[0].upper()}{K:g}", "strike": K, "bid": bid, "ask": ask,
-                    "lastPrice": round(p, 2), "volume": 150.0, "openInterest": 1200.0,
-                    "impliedVolatility": iv, "lastTradeDate": pd.Timestamp(self.now).tz_convert("UTC"),
+                    "contractSymbol": f"FAKE{expiry}{kind[0].upper()}{K:g}",
+                    "strike": K, "bid": 0.0 if self.off_hours else bid, "ask": 0.0 if self.off_hours else ask,
+                    "lastPrice": round(p, 2), "volume": 150.0, "openInterest": 0.0 if self.off_hours else 1200.0,
+                    "impliedVolatility": 1e-5 if self.off_hours else iv,
+                    "lastTradeDate": pd.Timestamp(traded).tz_convert("UTC"),
                 })
             sides[kind] = pd.DataFrame(rows)
         return sides["call"], sides["put"], Quote(S, self.now, "Fake options")

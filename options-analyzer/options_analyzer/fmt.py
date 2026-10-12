@@ -37,3 +37,11 @@ def money(x, digits: int = 2) -> str:
 
 def vol_points(x) -> str:
     return f"{x * 100:+.1f} จุด" if ok(x) else "n/a"
+
+
+def earnings_note(confirmed) -> str:
+    if confirmed is True:
+        return "Yahoo ระบุว่ายืนยันแล้ว"
+    if confirmed is False:
+        return "เป็นวันประมาณการ อาจเปลี่ยน"
+    return "ไม่ทราบว่ายืนยันแล้วหรือยัง"

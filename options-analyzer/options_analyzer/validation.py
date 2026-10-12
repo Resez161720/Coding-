@@ -187,14 +187,21 @@ def validate_chain(chain: pd.DataFrame, spot: float, T: float, r: float, q: floa
 
     n_quote = int((chain["price_source"] == "mid").sum())
     n_last = int((chain["price_source"] == "last").sum())
-    if n_quote == 0 and n_last > 0:
-        rep.add(area, "ราคาเสนอซื้อ/ขาย", WARN,
-                "ไม่มี bid/ask (ตลาดปิดหรือแหล่งข้อมูลไม่ส่งมา) — ใช้ราคาซื้อขายล่าสุดของวันทำการล่าสุดแทน "
-                "ความแม่นยำลดลง ควรรันใหม่ในเวลาตลาดเปิด")
-    elif n_quote == 0:
+    if n_quote + n_last == 0:
         rep.add(area, "ราคาเสนอซื้อ/ขาย", FAIL, "ไม่มีราคาที่ใช้ได้เลย")
+    elif n_quote < n_last:
+        rep.add(area, "ราคาเสนอซื้อ/ขาย", WARN,
+                f"มี bid/ask เพียง {n_quote} สัญญา (ตลาดปิดหรือแหล่งข้อมูลไม่ส่งมา) — ใช้ราคาซื้อขายล่าสุดช่วงท้ายตลาด "
+                f"{n_last} สัญญาแทน ไม่ทราบ spread จริง ควรรันใหม่ในเวลาตลาดเปิดก่อนตัดสินใจ")
     else:
         rep.add(area, "ราคาเสนอซื้อ/ขาย", PASS, f"มี bid/ask ที่ใช้ได้ {n_quote} สัญญา")
+
+    if float((chain["oi"] > 0).mean()) < 0.05:
+        rep.add(area, "Open Interest", WARN,
+                "แหล่งข้อมูลส่ง Open Interest เป็น 0 เกือบทุกสัญญา (Yahoo มักเป็นแบบนี้นอกเวลาตลาด) "
+                "— ไม่ใช้ OI ในการประเมิน")
+    else:
+        rep.add(area, "Open Interest", PASS, f"มี Open Interest {int((chain['oi'] > 0).sum())} สัญญา")
 
     below = int(chain["below_intrinsic"].sum())
     # Escalate only on live two-sided quotes near the money; stale last trades and wide deep-ITM
@@ -266,24 +273,35 @@ def _parity_check(area: str, chain: pd.DataFrame, spot: float, T: float, r: floa
     """Put-call parity: spot implied by C - P near the money must agree with the quote."""
     # All two-sided quotes, not just "usable" ones: a chain struck off the wrong spot fails the other
     # checks first, and filtering on them would hide exactly the evidence this check needs.
-    quoted = chain[chain["price_source"] == "mid"]
-    c = quoted[quoted["kind"] == "call"].set_index("strike")["price"]
-    p = quoted[quoted["kind"] == "put"].set_index("strike")["price"]
-    both = pd.concat([c, p], axis=1, join="inner", keys=["c", "p"])
-    # The 5 strikes nearest the spot that have both legs quoted (within ±20%).
-    dist = (both.index.to_series() / spot - 1).abs()
-    both = both[dist <= 0.20].loc[dist[dist <= 0.20].sort_values().index[:5]]
+    both = _parity_pairs(chain[chain["price_source"] == "mid"], spot)
+    source = "bid/ask"
     if both.empty:
-        return area, "Put-Call Parity", WARN, "ไม่มีคู่ Call/Put ที่มี bid/ask ในช่วง ±20% ของราคาหุ้นสำหรับตรวจ"
+        # Market closed: fall back to last trades (already restricted to the end of the session).
+        both = _parity_pairs(chain[chain["price_source"] == "last"], spot)
+        source = "ราคาซื้อขายล่าสุดช่วงท้ายตลาด"
+    if both.empty:
+        return area, "Put-Call Parity", WARN, "ไม่มีคู่ Call/Put ที่มีราคาในช่วง ±20% ของราคาหุ้นสำหรับตรวจ"
     implied = (both["c"] - both["p"] + both.index.to_numpy() * math.exp(-r * T)) * math.exp(q * T)
     s_impl = float(implied.median())
     diff = s_impl / spot - 1
-    detail = f"ราคาหุ้นที่คำนวณจาก Call−Put = {s_impl:,.2f} เทียบราคาจริง {spot:,.2f} ({diff:+.2%})"
+    detail = (f"ราคาหุ้นที่คำนวณจาก Call−Put ({source}, {len(both)} strike) = {s_impl:,.2f} "
+              f"เทียบราคาจริง {spot:,.2f} ({diff:+.2%})")
     if abs(diff) <= 0.015:
         return area, "Put-Call Parity", PASS, detail
-    if abs(diff) <= 0.05:
+    if abs(diff) <= 0.05 or source != "bid/ask":
+        # Last trades happen at different moments, so they can only warn, never prove a bad chain.
         return area, "Put-Call Parity", WARN, detail + " — ราคาออปชั่นกับหุ้นอาจไม่ได้มาจากเวลาเดียวกัน"
     return area, "Put-Call Parity", FAIL, detail + " — ราคาออปชั่นไม่สอดคล้องกับราคาหุ้น"
+
+
+def _parity_pairs(priced: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Call/put prices at the (up to) 5 strikes nearest the spot that have both legs, within ±20%."""
+    c = priced[priced["kind"] == "call"].set_index("strike")["price"]
+    p = priced[priced["kind"] == "put"].set_index("strike")["price"]
+    both = pd.concat([c, p], axis=1, join="inner", keys=["c", "p"])
+    dist = (both.index.to_series() / spot - 1).abs()
+    near = dist[dist <= 0.20].sort_values()
+    return both.loc[near.index[:5]]
 
 
 def _iv_roundtrip_check(area: str, usable: pd.DataFrame, spot: float, T: float, r: float,

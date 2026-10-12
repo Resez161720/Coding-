@@ -10,6 +10,7 @@ import pandas as pd
 from . import calendar_us as cal
 from .pricing import bs_greeks, implied_vol
 
+LAST_TRADE_WINDOW = pd.Timedelta(minutes=60)
 RAW_COLUMNS = ("contractSymbol", "strike", "bid", "ask", "lastPrice", "volume",
                "openInterest", "impliedVolatility", "lastTradeDate")
 
@@ -49,8 +50,14 @@ def build_chain(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, T: float, 
     ch["mid"] = np.where(has_quote & ~ch["crossed"], (ch["bid"] + ch["ask"]) / 2.0, np.nan)
     ch["spread_pct"] = np.where(ch["mid"] > 0, (ch["ask"] - ch["bid"]) / ch["mid"], np.nan)
 
+    # A last trade is only a usable price if it happened in the latest session and within
+    # LAST_TRADE_WINDOW of the newest trade in the chain, i.e. when the stock was at about the
+    # price we compare it with. Earlier trades would give a wrong IV.
+    trades = ch["last_trade"].dropna()
+    newest = trades.max() if len(trades) else None
     traded_recently = ch["last_trade"].apply(
-        lambda t: t is not None and not pd.isna(t) and t.date() >= last_session)
+        lambda t: newest is not None and not pd.isna(t) and t.date() >= last_session
+        and t >= newest - LAST_TRADE_WINDOW)
     use_last = ~(has_quote) & (ch["last"] > 0) & traded_recently
     ch["price_source"] = np.where(ch["mid"].notna(), "mid", np.where(use_last, "last", "none"))
     ch["price"] = np.where(ch["mid"].notna(), ch["mid"], np.where(use_last, ch["last"], np.nan))
@@ -135,3 +142,8 @@ def implied_prob_above(chain: pd.DataFrame, level: float, T: float, r: float) ->
     if not (0.0 <= prob <= 1.0):
         return float("nan")
     return float(prob)
+
+
+def oi_available(chain: pd.DataFrame) -> bool:
+    """Yahoo reports open interest as 0 for every contract outside market hours."""
+    return bool(len(chain)) and float((chain["oi"] > 0).mean()) >= 0.05
