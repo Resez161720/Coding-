@@ -4,7 +4,8 @@ from __future__ import annotations
 from . import calendar_us as cal
 from .analysis import AnalysisResult
 from .contracts import ContractEval
-from .fmt import DISCLAIMER, STATUS_TH, earnings_note, money, num, ok, pct, vol_points
+from .fmt import (DISCLAIMER, STATUS_TH, earnings_moves_text, money, next_earnings_text, num, ok, pct,
+                  quote_text, sessions_text, vol_points)
 from .validation import FAIL, PASS, WARN
 from .weekly import FEATURE_LABELS, LEAN_LABELS
 
@@ -90,13 +91,12 @@ def _options(res: AnalysisResult) -> list[str]:
     e = res.selected
     if e is None:
         return []
-    s = res.stock
-    out = [f"[4] ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / เหลือ {e.sessions} วันทำการ)"]
+    out = [f"[4] ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / เหลือ {sessions_text(e.sessions)} วันทำการ)"]
     if res.valuation_time is not None and res.valuation_time != res.generated_at:
         out.append(f"    ตลาดปิดอยู่: ราคาหุ้นและออปชั่นเป็นราคา ณ ปิดตลาด {res.valuation_time:%Y-%m-%d %H:%M} ET "
                    "และคำนวณเวลาถึงวันหมดอายุจากจุดนั้น")
     em = e.expected_move_iv
-    out.append(f"    ATM IV {pct(e.atm_iv)} | IV ÷ HV20 = {num(e.atm_iv / s.hv20 if ok(s.hv20) and s.hv20 else float('nan'))} "
+    out.append(f"    ATM IV {pct(e.atm_iv)} | IV ÷ HV20 (ฐานวันทำการ) = {num(e.iv_hv20)} "
                f"| Skew 25Δ (Put−Call) {vol_points(e.skew_25d)}")
     if ok(em):
         out.append(f"    กรอบราคาคาดการณ์ ±1 SD (ตาม IV): ±{num(em)} (±{pct(em / e.spot)}) → {num(e.spot - em)} – "
@@ -108,23 +108,17 @@ def _options(res: AnalysisResult) -> list[str]:
             verdict = ("ออปชั่นค่อนข้างแพงเมื่อเทียบกับอดีต" if e.hist_prob_exceed_straddle < 0.45 else
                        "ออปชั่นค่อนข้างถูกเมื่อเทียบกับอดีต" if e.hist_prob_exceed_straddle > 0.55 else
                        "ราคาใกล้เคียงกับการเคลื่อนไหวในอดีต")
-            out.append(f"      ในอดีต 5 ปี ราคาเคลื่อนไหวใน {e.sessions} วันทำการเกินระดับนี้ "
+            out.append(f"      ในอดีต 5 ปี ราคาเคลื่อนไหวใน {max(1, round(e.sessions))} วันทำการเกินระดับนี้ "
                        f"{pct(e.hist_prob_exceed_straddle)} ของครั้ง → {verdict}")
     out.append(f"    Put/Call Open Interest {num(e.put_call_oi)} | Put/Call Volume {num(e.put_call_volume)}")
     if res.term:
         out.append("    โครงสร้าง IV ตามวันหมดอายุ: " + " | ".join(f"{d:%m-%d} {pct(iv)}" for d, _, iv in res.term))
-    earn = res.earnings
-    if earn is not None:
-        if earn.status == "none":
-            out.append("    งบการเงิน: ไม่มี (ETF/ดัชนี)")
-        elif earn.upcoming:
-            out.append(f"    ประกาศงบครั้งถัดไป: {earn.upcoming[0]} ({earnings_note(earn.confirmed)})")
-        else:
-            out.append("    ประกาศงบครั้งถัดไป: ยืนยันไม่ได้ — โปรดตรวจสอบเองก่อนซื้อ")
-    if res.earnings_moves:
-        moves = [abs(m) for _, m in res.earnings_moves]
-        out.append(f"    การเคลื่อนไหวหลังประกาศงบ {len(moves)} ครั้งล่าสุด: เฉลี่ย ±{pct(sum(moves) / len(moves))} "
-                   f"(" + ", ".join(f"{d:%Y-%m-%d}: {m:+.1%}" for d, m in res.earnings_moves) + ")")
+    if res.earnings is not None:
+        out.append(f"    ประกาศงบครั้งถัดไป: {next_earnings_text(res)}")
+    avg, items, note = earnings_moves_text(res.earnings_moves)
+    if avg:
+        out.append(f"    การเคลื่อนไหวหลังประกาศงบ {len(res.earnings_moves)} ครั้งล่าสุด: เฉลี่ย {avg} ({items})")
+        out.append(f"      วัดจาก{note}")
     return out
 
 
@@ -148,7 +142,7 @@ def contract_detail(ev: ContractEval, title: str) -> list[str]:
     out = [
         f"[6] {title}: {ev.kind.upper()} strike {ev.strike:g} หมดอายุ {ev.expiry} ({ev.contract})",
         f"    ราคา {num(ev.price)} ({'ราคากลาง bid/ask' if ev.price_source == 'mid' else 'ราคาซื้อขายล่าสุด'}; "
-        f"bid {num(ev.bid)} / ask {num(ev.ask)}) → ต้นทุน {money(ev.cost)} ต่อสัญญา = ขาดทุนสูงสุด",
+        f"bid {quote_text(ev.bid)} / ask {quote_text(ev.ask)}) → ต้นทุน {money(ev.cost)} ต่อสัญญา = ขาดทุนสูงสุด",
         f"    จุดคุ้มทุน ณ วันหมดอายุ {num(ev.breakeven)} (หุ้นต้องเคลื่อนที่ {pct(ev.breakeven_move, 2, True)})",
         f"    IV {pct(ev.iv)} | Delta {ev.delta:+.3f} | Gamma {ev.gamma:.4f} | Theta {money(ev.theta * 100)}/วัน/สัญญา "
         f"| Vega {money(ev.vega * 100)}/1 จุด IV/สัญญา",
@@ -173,7 +167,8 @@ def render(res: AnalysisResult, verbose: bool = False) -> str:
     name = res.stock.name if res.stock else res.ticker
     out = [LINE, f" รายงานวิเคราะห์ก่อนซื้อออปชั่น: {res.ticker} — {name}",
            f" สร้างเมื่อ {cal.stamp(res.generated_at)} | ข้อมูล Yahoo Finance | "
-           f"อัตราดอกเบี้ย {pct(res.r, 2)} | ปันผล {pct(res.q, 2)}", LINE]
+           f"อัตราดอกเบี้ย {pct(res.r, 2) if res.r_source else 'n/a'} | "
+           f"ปันผล {pct(res.q, 2) if res.r_source else 'n/a'}", LINE]
     out += _validation(res, verbose)
     for e in res.errors:
         out.append(f"    !! {e}")
@@ -202,7 +197,7 @@ def render_scan(rows: list[AnalysisResult]) -> str:
         w, s, e = res.weekly, res.stock, res.selected
         m = w.model
         em = pct(e.expected_move_iv / e.spot) if e and ok(e.expected_move_iv) else "n/a"
-        ivhv = num(e.atm_iv / s.hv20) if e and ok(e.atm_iv) and ok(s.hv20) and s.hv20 else "n/a"
+        ivhv = num(e.iv_hv20) if e else "n/a"
         out.append(
             f" {res.ticker:6} {num(s.spot):>9} {pct(w.base_up_rate):>11} {pct(m.prob_up) if m else 'n/a':>7} "
             f"{('ใช่' if m and m.validated else 'ไม่'):>9} {pct(e.implied_prob_up) if e else 'n/a':>11} "

@@ -12,10 +12,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from options_analyzer import calendar_us as cal  # noqa: E402
-from options_analyzer.data import EarningsInfo, Quote  # noqa: E402
+from options_analyzer.data import EarningsEvent, EarningsInfo, Quote  # noqa: E402
 from options_analyzer.pricing import bs_price  # noqa: E402
 
 NOW = dt.datetime(2026, 10, 12, 11, 0, tzinfo=cal.NY)  # a Monday, market open
+
+
+def amc(d: dt.date) -> EarningsEvent:
+    """An after-the-close earnings report on day d."""
+    return EarningsEvent(d, dt.datetime.combine(d, dt.time(16, 5), tzinfo=cal.NY))
+
+
+def bmo(d: dt.date) -> EarningsEvent:
+    return EarningsEvent(d, dt.datetime.combine(d, dt.time(7, 0), tzinfo=cal.NY))
 
 
 def trading_dates(end: dt.date, n: int) -> list[dt.date]:
@@ -65,8 +74,8 @@ class FakeProvider:
         self.r = r
         self.now = now
         self.spread = spread
-        self.earn = earnings if earnings is not None else EarningsInfo(
-            "known", [now.date() + dt.timedelta(days=30)], [now.date() - dt.timedelta(days=60)])
+        self.earn = earnings if earnings is not None else EarningsInfo("known", [
+            amc(now.date() - dt.timedelta(days=60)), amc(now.date() + dt.timedelta(days=30))], True)
         self.expiries = [f"{d:%Y-%m-%d}" for d in fridays_after(now.date(), 6)]
         self.chain_overrides = {}
         # Off hours, Yahoo returns bid/ask/OI = 0 and the chain reflects the last session's close.

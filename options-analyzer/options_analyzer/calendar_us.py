@@ -70,6 +70,31 @@ def is_trading_day(d: dt.date) -> bool:
     return d.weekday() < 5 and d not in nyse_holidays(d.year)
 
 
+EARLY_CLOSE = dt.time(13, 0)
+
+
+@lru_cache(maxsize=None)
+def nyse_early_closes(year: int) -> frozenset[dt.date]:
+    """Sessions that close at 13:00 ET (equity options stop trading then too)."""
+    days = {_nth_weekday(year, 11, 3, 4) + dt.timedelta(days=1)}  # day after Thanksgiving
+    july3 = dt.date(year, 7, 3)
+    if july3.weekday() <= 3:  # Mon-Thu; when it is Friday it is the observed holiday instead
+        days.add(july3)
+    dec24 = dt.date(year, 12, 24)
+    if dec24.weekday() <= 3:
+        days.add(dec24)
+    return frozenset(d for d in days if is_trading_day(d))
+
+
+def session_close(d: dt.date) -> dt.time:
+    return EARLY_CLOSE if d in nyse_early_closes(d.year) else MARKET_CLOSE
+
+
+def session_hours(d: dt.date) -> float:
+    c = session_close(d)
+    return (c.hour * 60 + c.minute - (MARKET_OPEN.hour * 60 + MARKET_OPEN.minute)) / 60.0
+
+
 def previous_trading_day(d: dt.date) -> dt.date:
     d -= dt.timedelta(days=1)
     while not is_trading_day(d):
@@ -103,7 +128,8 @@ def trading_days_between(start: dt.date, end: dt.date) -> int:
 
 
 def market_is_open(now_ny: dt.datetime) -> bool:
-    return is_trading_day(now_ny.date()) and MARKET_OPEN <= now_ny.time() < MARKET_CLOSE
+    d = now_ny.date()
+    return is_trading_day(d) and MARKET_OPEN <= now_ny.time() < session_close(d)
 
 
 def now_ny() -> dt.datetime:
@@ -111,13 +137,28 @@ def now_ny() -> dt.datetime:
 
 
 def expiry_close(expiry: dt.date) -> dt.datetime:
-    """Options stop trading at the 16:00 ET close on the expiration date."""
-    return dt.datetime.combine(expiry, MARKET_CLOSE, tzinfo=NY)
+    """Options stop trading at the close on the expiration date (13:00 ET on early-close days)."""
+    return dt.datetime.combine(expiry, session_close(expiry), tzinfo=NY)
 
 
 def years_to_expiry(now: dt.datetime, expiry: dt.date) -> float:
     seconds = (expiry_close(expiry) - now).total_seconds()
     return max(seconds, 0.0) / (365.0 * 24 * 3600)
+
+
+def sessions_remaining(val: dt.datetime, expiry: dt.date) -> float:
+    """Trading sessions of price movement left between `val` and the expiry close.
+
+    Includes the unfinished part of today's session while the market is open, so the
+    count does not drop by a whole session at 09:30.
+    """
+    if val >= expiry_close(expiry):
+        return 0.0
+    n = float(trading_days_between(val.date(), expiry))
+    if market_is_open(val):
+        end = dt.datetime.combine(val.date(), session_close(val.date()), tzinfo=NY)
+        n += (end - val).total_seconds() / 3600.0 / session_hours(val.date())
+    return n
 
 
 def stamp(t: dt.datetime) -> str:
@@ -135,4 +176,5 @@ def valuation_time(now: dt.datetime) -> dt.datetime:
     """
     if market_is_open(now):
         return now
-    return dt.datetime.combine(last_session_with_data(now), MARKET_CLOSE, tzinfo=NY)
+    d = last_session_with_data(now)
+    return dt.datetime.combine(d, session_close(d), tzinfo=NY)

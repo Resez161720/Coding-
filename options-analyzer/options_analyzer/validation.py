@@ -60,7 +60,9 @@ def validate_history(df: pd.DataFrame, now_ny: dt.datetime, area: str = "รา�
     if missing:
         rep.add(area, "คอลัมน์ครบ", FAIL, f"ขาดคอลัมน์ {missing}")
         return rep, df
+    adj = df["AdjClose"] if "AdjClose" in df.columns else None
     df = df.loc[:, list(REQUIRED_COLUMNS)].copy()
+    df["AdjClose"] = df["Close"] if adj is None else adj
 
     if not df.index.is_monotonic_increasing:
         df = df.sort_index()
@@ -120,6 +122,16 @@ def validate_history(df: pd.DataFrame, now_ny: dt.datetime, area: str = "รา�
             rep.add(area, "การเคลื่อนไหวผิดปกติ", WARN,
                     f"พบราคาเปลี่ยนแรงใน 1 วัน: {dates} — อาจเป็นข่าวจริงหรือการแตกพาร์ที่ปรับไม่ถูก "
                     "สถิติความผันผวนอาจคลาดเคลื่อน โปรดตรวจสอบ")
+
+    if adj is not None and not df.empty:
+        # Dividend adjustment factor must be in (0, 1] and reach 1 at the latest bar.
+        ratio = df["AdjClose"] / df["Close"]
+        bad = ~ratio.between(0.01, 1.0005) | ratio.isna()
+        if bad.any() or abs(float(ratio.iloc[-1]) - 1) > 0.0005:
+            df["AdjClose"] = df["Close"]
+            rep.add(area, "ราคาปรับปันผล", WARN, "ราคาปรับปันผลผิดปกติ — ใช้ราคาปิดจริงแทนในการคำนวณผลตอบแทน")
+        else:
+            rep.add(area, "ราคาปรับปันผล", PASS, "ราคาปรับปันผลสอดคล้องกับราคาปิดจริง")
 
     if not df.empty:
         rep.add(*_staleness_check(area, df.index[-1].date(), now_ny))
@@ -191,7 +203,8 @@ def validate_chain(chain: pd.DataFrame, spot: float, T: float, r: float, q: floa
         rep.add(area, "ราคาเสนอซื้อ/ขาย", FAIL, "ไม่มีราคาที่ใช้ได้เลย")
     elif n_quote < n_last:
         rep.add(area, "ราคาเสนอซื้อ/ขาย", WARN,
-                f"มี bid/ask เพียง {n_quote} สัญญา (ตลาดปิดหรือแหล่งข้อมูลไม่ส่งมา) — ใช้ราคาซื้อขายล่าสุดช่วงท้ายตลาด "
+                (f"มี bid/ask เพียง {n_quote} สัญญา" if n_quote else "ไม่มี bid/ask")
+                + " (ตลาดปิดหรือแหล่งข้อมูลไม่ส่งมา) — ใช้ราคาซื้อขายล่าสุดช่วงท้ายตลาด "
                 f"{n_last} สัญญาแทน ไม่ทราบ spread จริง ควรรันใหม่ในเวลาตลาดเปิดก่อนตัดสินใจ")
     else:
         rep.add(area, "ราคาเสนอซื้อ/ขาย", PASS, f"มี bid/ask ที่ใช้ได้ {n_quote} สัญญา")
@@ -218,14 +231,22 @@ def validate_chain(chain: pd.DataFrame, spot: float, T: float, r: float, q: floa
     else:
         rep.add(area, "ราคาไม่ต่ำกว่ามูลค่าที่แท้จริง", PASS, "ทุกสัญญามีราคา ≥ intrinsic value")
 
-    rep.add(*_monotonic_check(area, chain))
+    rep.add(*_monotonic_check(area, chain, spot))
     rep.add(*_parity_check(area, chain, spot, T, r, q))
 
     usable = chain[chain["usable"]]
     if usable.empty:
         rep.add(area, "สัญญาที่ใช้ได้", FAIL, "ไม่มีสัญญาที่ผ่านการตรวจสอบเลย")
     else:
-        rep.add(area, "สัญญาที่ใช้ได้", PASS, f"ผ่านการตรวจสอบ {len(usable)} จาก {len(chain)} สัญญา")
+        dropped = []
+        n_stale_q = int(chain.get("stale_quote", pd.Series(dtype=bool)).sum())
+        n_stale_l = int(chain.get("stale_last", pd.Series(dtype=bool)).sum())
+        if n_stale_q:
+            dropped.append(f"bid/ask ค้างจากวันก่อน {n_stale_q} สัญญา")
+        if n_stale_l:
+            dropped.append(f"ราคาซื้อขายล่าสุดที่หุ้นเปลี่ยนราคาไปมากหลังจากนั้น {n_stale_l} สัญญา")
+        rep.add(area, "สัญญาที่ใช้ได้", PASS, f"ผ่านการตรวจสอบ {len(usable)} จาก {len(chain)} สัญญา"
+                + (f" (ตัดออก: {', '.join(dropped)})" if dropped else ""))
 
     rep.add(*_iv_roundtrip_check(area, usable, spot, T, r, q))
 
@@ -248,24 +269,37 @@ def validate_chain(chain: pd.DataFrame, spot: float, T: float, r: float, q: floa
     return rep
 
 
-def _monotonic_check(area: str, chain: pd.DataFrame) -> tuple[str, str, str, str]:
-    bad = 0
-    total = 0
+def _monotonic_check(area: str, chain: pd.DataFrame, spot: float) -> tuple[str, str, str, str]:
+    """Calls must not get dearer, puts not cheaper, as the strike rises.
+
+    Runs on the prices the analysis actually uses, within ±20% of the spot. A violation between two
+    live bid/ask quotes can fail the chain; one involving a last trade (taken at a different moment)
+    can only warn.
+    """
+    bad_mid = bad_last = total = 0
     for kind, sign in (("call", -1), ("put", 1)):
-        side = chain[(chain["kind"] == kind) & chain["usable"] & (chain["price_source"] == "mid")].sort_values("strike")
+        side = chain[(chain["kind"] == kind) & chain["usable"]
+                     & ((chain["strike"] / spot - 1).abs() <= 0.20)].sort_values("strike")
         p = side["price"].to_numpy()
+        src = side["price_source"].to_numpy()
         if len(p) < 2:
             continue
         step = np.diff(p) * sign  # calls should fall and puts rise with strike
         tol = 0.02 + 0.02 * np.maximum(p[:-1], p[1:])
-        bad += int((step < -tol).sum())
+        viol = step < -tol
+        both_mid = (src[:-1] == "mid") & (src[1:] == "mid")
+        bad_mid += int((viol & both_mid).sum())
+        bad_last += int((viol & ~both_mid).sum())
         total += len(step)
+    name = "ราคาสอดคล้องตาม strike"
     if total == 0:
-        return area, "ราคาสอดคล้องตาม strike", WARN, "มีข้อมูลไม่พอสำหรับตรวจ"
-    if bad == 0:
-        return area, "ราคาสอดคล้องตาม strike", PASS, "Call ถูกลงและ Put แพงขึ้นตาม strike ตามทฤษฎี"
-    status = WARN if bad / total <= 0.05 else FAIL
-    return area, "ราคาสอดคล้องตาม strike", status, f"ราคาไม่เรียงตามทฤษฎี {bad} จุดจาก {total}"
+        return area, name, WARN, "มีข้อมูลไม่พอสำหรับตรวจ"
+    if bad_mid + bad_last == 0:
+        return area, name, PASS, f"Call ถูกลงและ Put แพงขึ้นตาม strike ตามทฤษฎี (ตรวจ {total} คู่ในช่วง ±20%)"
+    detail = f"ราคาไม่เรียงตามทฤษฎี {bad_mid + bad_last} จุดจาก {total} คู่ในช่วง ±20%"
+    if bad_mid / total > 0.05:
+        return area, name, FAIL, detail
+    return area, name, WARN, detail + " — ตัดสินจากราคาต่างเวลากันหรือจำนวนน้อย จึงเป็นเพียงคำเตือน"
 
 
 def _parity_check(area: str, chain: pd.DataFrame, spot: float, T: float, r: float,

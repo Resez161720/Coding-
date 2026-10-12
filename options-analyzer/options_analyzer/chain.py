@@ -10,7 +10,14 @@ import pandas as pd
 from . import calendar_us as cal
 from .pricing import bs_greeks, implied_vol
 
-LAST_TRADE_WINDOW = pd.Timedelta(minutes=60)
+# Without a minute-by-minute stock price, only trades this close to the valuation time are trusted.
+LAST_TRADE_WINDOW = pd.Timedelta(minutes=15)
+# With it, older trades are allowed when the stock had not moved enough to matter (DRIFT_TOLERANCE
+# of the option's time value), still within this window so the time-to-expiry error stays small.
+LAST_TRADE_WINDOW_PATH = pd.Timedelta(minutes=120)
+DRIFT_TOLERANCE = 0.10
+# Options on broad ETFs (SPY, QQQ, IWM, ...) trade until 16:15 ET, after the stock's 16:00 close.
+LATE_OPTIONS_SESSION = pd.Timedelta(minutes=15)
 RAW_COLUMNS = ("contractSymbol", "strike", "bid", "ask", "lastPrice", "volume",
                "openInterest", "impliedVolatility", "lastTradeDate")
 
@@ -38,27 +45,37 @@ def _side(raw: pd.DataFrame, kind: str) -> pd.DataFrame:
 
 
 def build_chain(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, T: float, r: float, q: float,
-                last_session: dt.date) -> pd.DataFrame:
+                last_session: dt.date, val_time: dt.datetime | None = None, market_open: bool = True,
+                spot_path: pd.Series | None = None) -> pd.DataFrame:
+    """Normalised chain with our own IV/Greeks valued at `spot` and time-to-expiry `T`.
+
+    Prices are only used when they belong to the moment `spot` refers to:
+    - bid/ask: always while the market is open; off-hours only for contracts that traded in the
+      latest session (Yahoo keeps months-old quotes on strikes nobody trades);
+    - last trade (no quote): only from the latest session, near `val_time`, and only if the stock
+      had not moved enough since the trade to change the option's time value materially.
+    """
     frames = [_side(df, kind) for df, kind in ((calls, "call"), (puts, "put")) if df is not None and len(df)]
     if not frames:
         return pd.DataFrame()
     ch = pd.concat(frames, ignore_index=True)
     ch = ch.drop_duplicates(subset=["kind", "strike"], keep="first").reset_index(drop=True)
 
+    lt = ch["last_trade"]
+    traded_latest = lt.notna() & lt.apply(lambda t: not pd.isna(t) and t.date() >= last_session)
     has_quote = (ch["bid"] > 0) & (ch["ask"] > 0)
-    ch["crossed"] = has_quote & (ch["bid"] > ch["ask"])
-    ch["mid"] = np.where(has_quote & ~ch["crossed"], (ch["bid"] + ch["ask"]) / 2.0, np.nan)
+    live_quote = has_quote & (market_open | traded_latest)
+    ch["stale_quote"] = has_quote & ~live_quote
+    ch["crossed"] = live_quote & (ch["bid"] > ch["ask"])
+    ch["mid"] = np.where(live_quote & ~ch["crossed"], (ch["bid"] + ch["ask"]) / 2.0, np.nan)
     ch["spread_pct"] = np.where(ch["mid"] > 0, (ch["ask"] - ch["bid"]) / ch["mid"], np.nan)
 
-    # A last trade is only a usable price if it happened in the latest session and within
-    # LAST_TRADE_WINDOW of the newest trade in the chain, i.e. when the stock was at about the
-    # price we compare it with. Earlier trades would give a wrong IV.
-    trades = ch["last_trade"].dropna()
-    newest = trades.max() if len(trades) else None
-    traded_recently = ch["last_trade"].apply(
-        lambda t: newest is not None and not pd.isna(t) and t.date() >= last_session
-        and t >= newest - LAST_TRADE_WINDOW)
-    use_last = ~(has_quote) & (ch["last"] > 0) & traded_recently
+    recent = traded_latest
+    if val_time is not None:
+        window = LAST_TRADE_WINDOW_PATH if spot_path is not None else LAST_TRADE_WINDOW
+        late = pd.Timedelta(minutes=1) if market_open else LATE_OPTIONS_SESSION
+        recent = recent & lt.apply(lambda t: not pd.isna(t) and val_time - window <= t <= val_time + late)
+    use_last = ch["mid"].isna() & ~ch["crossed"] & (ch["last"] > 0) & recent
     ch["price_source"] = np.where(ch["mid"].notna(), "mid", np.where(use_last, "last", "none"))
     ch["price"] = np.where(ch["mid"].notna(), ch["mid"], np.where(use_last, ch["last"], np.nan))
 
@@ -68,30 +85,47 @@ def build_chain(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, T: float, 
     tol = np.maximum(0.05, 0.02 * intrinsic)
     ch["below_intrinsic"] = ch["price"].notna() & (ch["price"] < intrinsic - tol)
 
-    ivs, deltas, gammas, thetas, vegas = [], [], [], [], []
+    cols = {k: [] for k in ("iv", "delta", "gamma", "theta", "vega", "stale_last", "spot_at_trade")}
     for row in ch.itertuples(index=False):
-        iv = None
+        iv, g, stale, s_trade = None, None, False, np.nan
         if row.price_source != "none" and not row.crossed and not row.below_intrinsic and T > 0:
             iv = implied_vol(float(row.price), spot, float(row.strike), T, r, row.kind, q)
-        ivs.append(np.nan if iv is None else iv)
         if iv is not None:
             g = bs_greeks(spot, float(row.strike), T, r, iv, row.kind, q)
-            deltas.append(g.delta)
-            gammas.append(g.gamma)
-            thetas.append(g.theta_per_day)
-            vegas.append(g.vega_per_point)
-        else:
-            deltas.append(np.nan)
-            gammas.append(np.nan)
-            thetas.append(np.nan)
-            vegas.append(np.nan)
-    ch["iv"] = ivs
-    ch["delta"] = deltas
-    ch["gamma"] = gammas
-    ch["theta"] = thetas
-    ch["vega"] = vegas
+            if row.price_source == "last" and spot_path is not None:
+                s_trade = _spot_at(spot_path, row.last_trade)
+                if np.isnan(s_trade):
+                    stale = True
+                else:
+                    # Price error from the stock having moved since the trade, vs. the time value
+                    # that the IV is solved from.
+                    drift = abs(g.delta) * abs(s_trade - spot)
+                    extrinsic = float(row.price) - float(row.intrinsic)
+                    stale = drift > max(DRIFT_TOLERANCE * extrinsic, 0.02)
+            if stale:
+                iv, g = None, None
+        cols["iv"].append(np.nan if iv is None else iv)
+        cols["delta"].append(g.delta if g else np.nan)
+        cols["gamma"].append(g.gamma if g else np.nan)
+        cols["theta"].append(g.theta_per_day if g else np.nan)
+        cols["vega"].append(g.vega_per_point if g else np.nan)
+        cols["stale_last"].append(stale)
+        cols["spot_at_trade"].append(s_trade)
+    for k, v in cols.items():
+        ch[k] = v
     ch["usable"] = ch["iv"].notna()
     return ch.sort_values(["kind", "strike"]).reset_index(drop=True)
+
+
+def _spot_at(path: pd.Series, t) -> float:
+    """Stock price on the 1-minute bar covering time t (NaN if t is outside the path)."""
+    if t is None or pd.isna(t) or path.empty:
+        return float("nan")
+    t = pd.Timestamp(t)
+    if t < path.index[0] or t > path.index[-1] + pd.Timedelta(minutes=2):
+        return float("nan")
+    v = path.asof(t.floor("min"))
+    return float(v) if pd.notna(v) else float("nan")
 
 
 def atm_iv(chain: pd.DataFrame, spot: float) -> float:

@@ -8,11 +8,13 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .fmt import sessions_text
 from .pricing import prob_above, prob_itm, prob_touch
 from .stats import EmpiricalProb, empirical_prob_horizon
 from .validation import FAIL, PASS, WARN
 
 POINTS = {PASS: 0, WARN: 1, FAIL: 2}
+
 
 
 @dataclass
@@ -32,12 +34,14 @@ class Context:
     T: float
     expiry: dt.date
     today: dt.date
-    sessions: int  # trading sessions until expiry
-    close: pd.Series
+    sessions: float  # trading sessions of movement left until expiry
+    close: pd.Series  # daily closes as traded
     hv20: float
     hv60: float
     earnings_status: str
-    earnings_dates: list[dt.date]
+    earnings_hits: list[dt.date]  # reports that can come out between the price time and expiry
+    next_earnings: dt.date | None
+    iv_factor: float  # turns calendar-time IV into per-trading-day IV, comparable with HV
     above_sma50: bool | None
     above_sma200: bool | None
     lean: str
@@ -51,7 +55,7 @@ class ContractEval:
     expiry: dt.date
     contract: str
     dte: int
-    sessions: int
+    sessions: float
     bid: float
     ask: float
     price: float
@@ -101,15 +105,6 @@ def risk_level(score: float, n_fail: int = 0) -> str:
     return LEVELS[i]
 
 
-def earnings_between(dates: list[dt.date], start: dt.date, end: dt.date) -> list[dt.date]:
-    """Earnings dates that can affect a contract alive from `start` to `end`.
-
-    One day of slack after expiry: a provider date converted in a time zone ahead
-    of New York (e.g. Thailand) can land one day later than the real report date.
-    """
-    return [d for d in dates if start <= d <= end + dt.timedelta(days=1)]
-
-
 def evaluate(row: pd.Series, ctx: Context) -> ContractEval:
     kind = row["kind"]
     K = float(row["strike"])
@@ -123,7 +118,8 @@ def evaluate(row: pd.Series, ctx: Context) -> ContractEval:
     if breakeven > 0:
         p_be_above = prob_above(S, breakeven, T, r, iv, q)
         pop = p_be_above if kind == "call" else 1 - p_be_above
-        hist = empirical_prob_horizon(ctx.close, max(ctx.sessions, 1), math.log(breakeven / S), above=kind == "call")
+        hist = empirical_prob_horizon(ctx.close, max(1, round(ctx.sessions)), math.log(breakeven / S),
+                                      above=kind == "call")
     else:
         pop = 0.0
         hist = EmpiricalProb(0.0, 0, float("nan"), float("nan"))
@@ -146,8 +142,8 @@ def evaluate(row: pd.Series, ctx: Context) -> ContractEval:
         prob_itm=prob_itm(S, K, T, r, iv, kind, q), prob_profit=pop, prob_profit_hist=hist,
         prob_double=p_double, prob_touch=prob_touch(S, K, T, r, iv, kind, q),
         theta_pct=abs(float(row["theta"])) / price if price > 0 else float("nan"),
-        iv_hv=iv / hv if math.isfinite(hv) else float("nan"),
-        earnings_in_window=earnings_between(ctx.earnings_dates, ctx.today, ctx.expiry),
+        iv_hv=iv * ctx.iv_factor / hv if math.isfinite(hv) and math.isfinite(ctx.iv_factor) else float("nan"),
+        earnings_in_window=list(ctx.earnings_hits),
     )
     ev.criteria = _criteria(ev, ctx, sign)
     total = sum(2 * c.weight for c in ev.criteria)
@@ -179,20 +175,20 @@ def _criteria(ev: ContractEval, ctx: Context, sign: int) -> list[Criterion]:
     c.append(Criterion("ค่าเสื่อมเวลา (Theta) ต่อวัน", _grade(ev.theta_pct, 0.03, 0.07, False),
                        f"{ev.theta_pct:.1%} ของราคาออปชั่นต่อวัน (${abs(ev.theta) * 100:,.2f}/สัญญา)",
                        "≤3% ดี, ≤7% พอใช้, >7% มูลค่าหายเร็ว", 2))
-    c.append(Criterion("ระยะเวลาถึงวันหมดอายุ", _grade(ev.dte, 21, 7, True), f"{ev.dte} วัน ({ev.sessions} วันทำการ)",
+    c.append(Criterion("ระยะเวลาถึงวันหมดอายุ", _grade(ev.dte, 21, 7, True),
+                       f"{ev.dte} วัน (เหลือ {sessions_text(ev.sessions)} วันทำการ)",
                        "≥21 วัน ดี, 7–20 วัน ระวัง, <7 วัน เสี่ยงสูง (theta/gamma)", 2))
     c.append(Criterion("ราคาออปชั่นแพง/ถูก (IV ÷ HV20)", _grade(ev.iv_hv, 1.10, 1.40, False),
                        f"{ev.iv_hv:.2f} เท่า" if math.isfinite(ev.iv_hv) else "คำนวณไม่ได้",
-                       "≤1.10 ราคาสมเหตุสมผล, ≤1.40 ค่อนข้างแพง, >1.40 แพงมากสำหรับผู้ซื้อ", 2))
+                       "เทียบบนฐานวันทำการเดียวกัน: ≤1.10 ราคาสมเหตุสมผล, ≤1.40 ค่อนข้างแพง, >1.40 แพงมากสำหรับผู้ซื้อ", 2))
     if ctx.earnings_status == "none":
         c.append(Criterion("ประกาศงบก่อนหมดอายุ", PASS, "ไม่มี (ETF/ดัชนี)", "มีงบ = เสี่ยง IV crush และ gap", 2))
     elif ev.earnings_in_window:
         days = ", ".join(f"{d:%Y-%m-%d}" for d in ev.earnings_in_window)
         c.append(Criterion("ประกาศงบก่อนหมดอายุ", FAIL, f"มี ({days})",
                            "ราคาออปชั่นมักร่วงหลังงบ (IV crush) แม้หุ้นวิ่งถูกทาง", 2))
-    elif ctx.earnings_status == "known":
-        c.append(Criterion("ประกาศงบก่อนหมดอายุ", PASS,
-                           f"ไม่มี (งบถัดไป {ctx.earnings_dates[0]:%Y-%m-%d})" if ctx.earnings_dates else "ไม่มี",
+    elif ctx.next_earnings is not None:
+        c.append(Criterion("ประกาศงบก่อนหมดอายุ", PASS, f"ไม่มี (งบถัดไป {ctx.next_earnings:%Y-%m-%d})",
                            "มีงบ = เสี่ยง IV crush และ gap", 2))
     else:
         c.append(Criterion("ประกาศงบก่อนหมดอายุ", WARN, "ยืนยันวันประกาศงบไม่ได้",
@@ -200,9 +196,17 @@ def _criteria(ev: ContractEval, ctx: Context, sign: int) -> list[Criterion]:
     c.append(Criterion("Delta (โอกาสแบบลอตเตอรี่)", _grade(abs(ev.delta), 0.30, 0.15, True), f"{ev.delta:+.2f}",
                        "|Δ| ≥0.30 ดี, 0.15–0.30 ระวัง, <0.15 ต้องวิ่งแรงมากถึงจะกำไร", 1))
     c.append(_trend_criterion(ev, ctx, sign))
-    c.append(Criterion("คุณภาพราคาที่ใช้คำนวณ", PASS if ev.price_source == "mid" else WARN,
-                       "ราคากลาง bid/ask" if ev.price_source == "mid" else "ราคาซื้อขายล่าสุด (อาจไม่ใช่ราคาปัจจุบัน)",
-                       "ควรมี bid/ask สด", 1))
+    hv_ref = ctx.hv60 if math.isfinite(ctx.hv60) and ctx.hv60 > 0 else ctx.hv20
+    iv_odd = math.isfinite(hv_ref) and ev.iv > max(4 * hv_ref, 1.5)
+    if iv_odd:
+        c.append(Criterion("คุณภาพราคาที่ใช้คำนวณ", WARN,
+                           f"IV {ev.iv:.0%} สูงผิดปกติเทียบ HV60 {hv_ref:.0%} — ราคาอาจค้างหรือผิด ตรวจกับโบรกเกอร์",
+                           "ควรมี bid/ask สด และ IV ไม่ห่างจากความผันผวนจริงแบบผิดปกติ", 1))
+    else:
+        c.append(Criterion("คุณภาพราคาที่ใช้คำนวณ", PASS if ev.price_source == "mid" else WARN,
+                           "ราคากลาง bid/ask" if ev.price_source == "mid"
+                           else "ราคาซื้อขายล่าสุดช่วงท้ายตลาด (ไม่ใช่ bid/ask สด)",
+                           "ควรมี bid/ask สด", 1))
     return c
 
 

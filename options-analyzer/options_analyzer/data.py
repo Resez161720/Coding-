@@ -22,12 +22,32 @@ class Quote:
     source: str
 
 
+@dataclass(frozen=True)
+class EarningsEvent:
+    date: dt.date  # report date in New York
+    when: dt.datetime | None = None  # exact New York time when the provider gives one
+    exact_date: bool = True  # False when a local time-zone conversion may have shifted the date by +1 day
+
+    @property
+    def timing(self) -> str:
+        """'AMC' (after the close), 'BMO' (before the open) or 'unknown'."""
+        if self.when is None or not self.exact_date:
+            return "unknown"
+        t = self.when.time()
+        if t == dt.time(0, 0):  # date-only placeholder
+            return "unknown"
+        if t >= dt.time(15, 0):  # Yahoo stamps after-close reports 15:00-16:00 depending on DST
+            return "AMC"
+        if t < cal.MARKET_OPEN:
+            return "BMO"
+        return "unknown"
+
+
 @dataclass
 class EarningsInfo:
-    status: str  # "known", "none" (ETF/index), "unknown"
-    upcoming: list[dt.date] = field(default_factory=list)
-    past: list[dt.date] = field(default_factory=list)
-    confirmed: bool | None = None  # False = provider marks the next date as an estimate
+    status: str  # "known" (provider returned dates), "none" (ETF/index), "unknown"
+    events: list[EarningsEvent] = field(default_factory=list)
+    confirmed: bool | None = None  # Yahoo's flag for its next scheduled date (False = estimate)
 
 
 class Provider(Protocol):
@@ -39,6 +59,7 @@ class Provider(Protocol):
     def earnings(self, symbol: str) -> EarningsInfo: ...
     def dividends(self, symbol: str) -> pd.Series: ...
     def risk_free_rate(self) -> tuple[float | None, str]: ...
+    # Optional: def intraday(self, symbol: str) -> pd.Series | None  (1-minute closes, America/New_York)
 
 
 def normalise_history(df: pd.DataFrame) -> pd.DataFrame:
@@ -112,12 +133,29 @@ class YahooProvider:
         raise RuntimeError(f"ดึงข้อมูลไม่สำเร็จหลังลอง {self._retries} ครั้ง: {last}") from last
 
     def history(self, symbol: str, period: str = "10y") -> pd.DataFrame:
+        """Daily bars as traded (split-adjusted, like a broker chart) plus a dividend-adjusted AdjClose."""
         key = (symbol, period)
         if key not in self._history_cache:
             df = self._retry(lambda: self._t(symbol).history(period=period, interval="1d",
-                                                             auto_adjust=True, actions=False))
-            self._history_cache[key] = normalise_history(df)
+                                                             auto_adjust=False, actions=False))
+            df = normalise_history(df).rename(columns={"Adj Close": "AdjClose"})
+            self._history_cache[key] = df
         return self._history_cache[key].copy()
+
+    def intraday(self, symbol: str) -> pd.Series | None:
+        """1-minute closes for the last few sessions, used to date-check option last trades."""
+        try:
+            # prepost: ETF options (SPY, QQQ, ...) keep trading until 16:15, after the stock's close.
+            df = self._retry(lambda: self._t(symbol).history(period="5d", interval="1m", auto_adjust=False,
+                                                             actions=False, prepost=True))
+        except Exception:
+            return None
+        if df is None or df.empty or "Close" not in df:
+            return None
+        s = df["Close"].dropna()
+        idx = pd.DatetimeIndex(s.index)
+        s.index = idx.tz_convert(cal.NY) if idx.tz is not None else idx.tz_localize(cal.NY)
+        return s.sort_index()
 
     def quotes(self, symbol: str) -> list[Quote]:
         """Live quote from the chart endpoint metadata (fetched together with history)."""
@@ -131,7 +169,15 @@ class YahooProvider:
         return out
 
     def expirations(self, symbol: str) -> list[str]:
-        return list(self._retry(lambda: self._t(symbol).options))
+        """Yahoo answers a rate-limited request with an empty list, so retry before believing it."""
+        for i in range(self._retries):
+            exp = list(self._retry(lambda: self._t(symbol).options))
+            if exp:
+                return exp
+            if i < self._retries - 1:
+                self._tickers.pop(symbol, None)  # fresh session and crumb
+                time.sleep(self._pause * (i + 1))
+        return []
 
     def chain(self, symbol: str, expiry: str) -> tuple[pd.DataFrame, pd.DataFrame, Quote]:
         oc = self._retry(lambda: self._t(symbol).option_chain(expiry))
@@ -144,26 +190,41 @@ class YahooProvider:
             info = self._t(symbol).info or {}
         except Exception:
             return {}
-        keys = ("shortName", "longName", "quoteType", "currency", "exchange", "sector", "industry")
+        keys = ("shortName", "longName", "quoteType", "currency", "exchange", "sector", "industry",
+                "preMarketPrice", "preMarketTime", "postMarketPrice", "postMarketTime")
         return {k: info.get(k) for k in keys if info.get(k) is not None}
+
+    def extended_quote(self, symbol: str) -> Quote | None:
+        """Most recent pre- or post-market price, if Yahoo has one."""
+        prof = self.profile(symbol)
+        best = None
+        for p_key, t_key, label in (("preMarketPrice", "preMarketTime", "pre-market"),
+                                    ("postMarketPrice", "postMarketTime", "post-market")):
+            price, t = _finite(prof.get(p_key)), _ts_to_ny(prof.get(t_key))
+            if price and t and (best is None or t > best.time):
+                best = Quote(price, t, f"Yahoo {label}")
+        return best
 
     def earnings(self, symbol: str) -> EarningsInfo:
         prof = self.profile(symbol)
         if prof.get("quoteType") in ("ETF", "INDEX", "MUTUALFUND"):
             return EarningsInfo("none")
-        upcoming: set[dt.date] = set()
-        past: set[dt.date] = set()
-        today = cal.now_ny().date()
+        events: dict[dt.date, EarningsEvent] = {}
         confirmed = None
+
+        def add(t: dt.datetime | None, d: dt.date, exact: bool = True) -> None:
+            if d not in events or (events[d].when is None and t is not None):
+                events[d] = EarningsEvent(d, t, exact)
+
         try:
-            # Raw calendarEvents carries exact timestamps and Yahoo's "is estimate" flag, which
-            # yfinance's .calendar drops (and converts in the local time zone, which can shift the date).
+            # Raw calendarEvents: exact timestamps and Yahoo's "is estimate" flag, both dropped by
+            # yfinance's .calendar (which also converts in the local time zone and can shift the date).
             raw = self._t(symbol)._quote._fetch(modules=["calendarEvents"])
             earn = raw["quoteSummary"]["result"][0]["calendarEvents"].get("earnings") or {}
             for ts in earn.get("earningsDate") or []:
                 t = _ts_to_ny(ts)
-                if t is not None and t.date() >= today:
-                    upcoming.add(t.date())
+                if t is not None:
+                    add(t, t.date())
             if "isEarningsDateEstimate" in earn:
                 confirmed = not bool(earn["isEarningsDateEstimate"])
         except Exception:
@@ -172,24 +233,25 @@ class YahooProvider:
             ed = self._t(symbol).get_earnings_dates(limit=16)
             if ed is not None and len(ed):
                 for ts in pd.DatetimeIndex(ed.index):
-                    d = (ts.tz_convert(cal.NY) if ts.tzinfo else ts).date()
-                    (upcoming if d >= today else past).add(d)
+                    t = _ts_to_ny(ts)
+                    if t is not None:
+                        add(t, t.date())
         except Exception:
             pass
-        if not upcoming:
+        today = cal.now_ny().date()
+        if not any(d >= today - dt.timedelta(days=1) for d in events):
             try:
                 calendar = self._t(symbol).calendar or {}
                 for d in calendar.get("Earnings Date", []) or []:
                     if isinstance(d, dt.datetime):
                         d = d.date()
-                    if isinstance(d, dt.date) and d >= today:
-                        upcoming.add(d)
+                    if isinstance(d, dt.date):
+                        add(None, d, exact=False)
             except Exception:
                 pass
-        if not upcoming and not past:
+        if not events:
             return EarningsInfo("unknown")
-        return EarningsInfo("known" if upcoming else "unknown", sorted(upcoming), sorted(past),
-                            confirmed if upcoming else None)
+        return EarningsInfo("known", sorted(events.values(), key=lambda e: e.date), confirmed)
 
     def dividends(self, symbol: str) -> pd.Series:
         try:

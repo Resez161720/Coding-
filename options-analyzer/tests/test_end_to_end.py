@@ -2,6 +2,7 @@ import datetime as dt
 import math
 from collections import namedtuple
 
+import numpy as np
 import pandas as pd
 import pytest
 from conftest import NOW, FakeProvider
@@ -45,7 +46,7 @@ def test_contract_probabilities_match_independent_formulas():
     assert ev.breakeven == pytest.approx(be)
     assert ev.prob_profit == pytest.approx(norm_cdf(-d2), abs=1e-12)
     assert ev.prob_profit == pytest.approx(1 - prob_above(S, be, T, r, ev.iv), abs=1e-12)
-    hist = empirical_prob_horizon(p.hist["Close"], ev.sessions, math.log(be / S), above=False)
+    hist = empirical_prob_horizon(p.hist["Close"], max(1, round(ev.sessions)), math.log(be / S), above=False)
     assert ev.prob_profit_hist.prob == pytest.approx(hist.prob)
     assert ev.cost == pytest.approx(ev.price * 100)
 
@@ -59,7 +60,8 @@ def test_model_free_probability_is_close_to_lognormal():
 
 
 def test_earnings_before_expiry_fails_the_criterion():
-    p = FakeProvider(earnings=EarningsInfo("known", [dt.date(2026, 10, 14)], []))
+    from conftest import amc
+    p = FakeProvider(earnings=EarningsInfo("known", [amc(dt.date(2026, 10, 14))]))
     res = analyze("TEST", p, now=NOW, focus=("call", round(p.spot)))
     crit = {c.name: c for c in res.focus.criteria}
     assert crit["ประกาศงบก่อนหมดอายุ"].status == FAIL
@@ -109,8 +111,13 @@ def _fake_yf(provider: FakeProvider):
             self.dividends = pd.Series([0.25, 0.25], index=pd.DatetimeIndex(
                 ["2026-03-10", "2026-09-10"]).tz_localize(cal.NY))
 
-        def history(self, period, interval, auto_adjust, actions):
-            assert interval == "1d" and auto_adjust is True
+        def history(self, period, interval, auto_adjust, actions, prepost=False):
+            assert auto_adjust is False  # raw prices + "Adj Close", like a broker chart
+            if interval == "1m":
+                # Flat intraday path ending at the spot on the last session.
+                idx = pd.date_range(dt.datetime(2026, 10, 12, 9, 30), periods=90, freq="min", tz=cal.NY)
+                return pd.DataFrame({"Close": provider.spot}, index=idx)
+            assert interval == "1d"
             if self.symbol == "^IRX":
                 return pd.DataFrame({"Open": 4.4, "High": 4.4, "Low": 4.4, "Close": 4.4, "Volume": 0.0},
                                     index=hist.index[-20:])
@@ -121,7 +128,10 @@ def _fake_yf(provider: FakeProvider):
                 m = provider.market.copy()
                 m.index = m.index.tz_localize(cal.NY)
                 return m
-            return hist
+            h = hist.copy()
+            # Dividend-adjusted close: earlier bars scaled down slightly, latest bar unchanged.
+            h["Adj Close"] = h["Close"] * np.linspace(0.97, 1.0, len(h))
+            return h
 
         def option_chain(self, expiry):
             calls, puts, _ = provider.chain(self.symbol, expiry)
@@ -153,7 +163,8 @@ def test_yahoo_provider_parsing(monkeypatch):
     r, src = yp.risk_free_rate()
     assert r == pytest.approx(0.044) and "^IRX" in src
     e = yp.earnings("TEST")
-    assert e.status == "known" and e.upcoming == [dt.date(2026, 11, 11)] and e.past == [dt.date(2026, 7, 30)]
+    assert e.status == "known" and [x.date for x in e.events] == [dt.date(2026, 7, 30), dt.date(2026, 11, 11)]
+    assert [x.timing for x in e.events] == ["AMC", "AMC"]
     assert e.confirmed is True
     d = yp.dividends("TEST")
     assert d.sum() == pytest.approx(0.5)
@@ -217,6 +228,9 @@ def test_stale_last_trades_are_not_priced():
     calls.loc[calls.index[:5], "lastTradeDate"] = pd.Timestamp("2026-10-09 15:00", tz="UTC")  # 11:00 ET
     T = cal.years_to_expiry(p.price_time, dt.date.fromisoformat(exp))
     from options_analyzer.chain import build_chain
-    ch = build_chain(calls, puts, p.spot, T, p.r, 0.0, dt.date(2026, 10, 9))
+    ch = build_chain(calls, puts, p.spot, T, p.r, 0.0, dt.date(2026, 10, 9), val_time=p.price_time,
+                     market_open=False)
     stale = ch[(ch["kind"] == "call") & ch["strike"].isin(calls["strike"].iloc[:5])]
     assert (stale["price_source"] == "none").all()
+    fresh = ch[(ch["kind"] == "call") & ~ch["strike"].isin(calls["strike"].iloc[:5])]
+    assert (fresh["price_source"] == "last").any()

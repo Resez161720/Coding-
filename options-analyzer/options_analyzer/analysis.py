@@ -9,9 +9,10 @@ import numpy as np
 import pandas as pd
 
 from . import calendar_us as cal
-from .chain import atm_iv, atm_straddle, build_chain, implied_prob_above, oi_available
+from . import earnings as earn_mod
+from .chain import LATE_OPTIONS_SESSION, atm_iv, atm_straddle, build_chain, implied_prob_above, oi_available
 from .contracts import Context, ContractEval, evaluate, find_contract, pick_candidates, sanity_errors
-from .data import EarningsInfo, Provider, Quote
+from .data import EarningsEvent, EarningsInfo, Provider, Quote
 from .pricing import expected_move
 from .stats import (atr, beta, horizon_log_returns, hv_close_to_close, hv_parkinson, hv_percentile,
                     max_drawdown, rsi, sma)
@@ -52,10 +53,12 @@ class StockSummary:
 class ExpiryInfo:
     expiry: dt.date
     dte: int
-    sessions: int
+    sessions: float  # trading sessions of movement left, incl. the unfinished part of today
     T: float
     spot: float
     atm_iv: float
+    iv_hv20: float  # ATM IV restated per trading day (same basis as HV) / HV20
+    price_basis: str  # "mid", "last" or "mixed": what the usable option prices are
     straddle_strike: float | None
     straddle_price: float | None
     expected_move_iv: float
@@ -82,7 +85,8 @@ class AnalysisResult:
     r_source: str = ""
     q: float = 0.0
     earnings: EarningsInfo | None = None
-    earnings_moves: list[tuple[dt.date, float]] = field(default_factory=list)
+    next_earnings: EarningsEvent | None = None
+    earnings_moves: list[tuple[dt.date, float, str]] = field(default_factory=list)
     expirations: list[str] = field(default_factory=list)
     term: list[tuple[dt.date, int, float]] = field(default_factory=list)
     selected: ExpiryInfo | None = None
@@ -126,20 +130,6 @@ def _skew(chain: pd.DataFrame) -> float:
     return float(p["iv"] - c["iv"])
 
 
-def _earnings_moves(close: pd.Series, dates: list[dt.date], n: int = 8) -> list[tuple[dt.date, float]]:
-    """Close before the report date -> close after it (covers before-open and after-close reports)."""
-    out = []
-    idx = close.index
-    for d in sorted(dates)[-n:]:
-        ts = pd.Timestamp(d)
-        before = idx[idx < ts]
-        after = idx[idx > ts]
-        if len(before) == 0 or len(after) == 0 or (after[0] - ts).days > 5:
-            continue
-        out.append((d, float(close.loc[after[0]] / close.loc[before[-1]] - 1)))
-    return out
-
-
 def _check_quote_time(t: dt.datetime | None, now: dt.datetime, rep: ValidationReport) -> None:
     if t is None:
         rep.add("ราคาปัจจุบัน", "เวลาของราคา", WARN, "แหล่งข้อมูลไม่ระบุเวลาของราคา")
@@ -172,12 +162,50 @@ def _cross_check_quotes(quotes: list[Quote], rep: ValidationReport) -> None:
         rep.add("ราคาปัจจุบัน", "ตรวจไขว้ 2 แหล่ง", FAIL, detail + " — ราคาไม่ตรงกัน")
 
 
+def _check_extended_hours(provider, ticker: str, spot: float, val: dt.datetime, now: dt.datetime,
+                          rep: ValidationReport) -> None:
+    """Off-hours: has the stock already moved in pre/post-market trading since the prices we use?"""
+    if val == now or not hasattr(provider, "extended_quote"):
+        return
+    try:
+        ext = provider.extended_quote(ticker)
+    except Exception:
+        return
+    if ext is None or ext.price is None or ext.time is None or ext.time <= val:
+        return
+    chg = ext.price / spot - 1
+    detail = (f"{ext.source} {ext.price:,.2f} ณ {ext.time:%Y-%m-%d %H:%M} ET เทียบราคาปิดที่ใช้คำนวณ "
+              f"{spot:,.2f} ({chg:+.2%})")
+    if abs(chg) <= 0.02:
+        rep.add("ราคาปัจจุบัน", "ราคานอกเวลาทำการ", PASS, detail)
+    else:
+        rep.add("ราคาปัจจุบัน", "ราคานอกเวลาทำการ", WARN,
+                detail + " — ราคาเปิดตลาดรอบหน้าอาจต่างจากที่ใช้คำนวณมาก ตัวเลขออปชั่นจะเปลี่ยนตาม")
+
+
+def _usable_path(path: pd.Series | None, val: dt.datetime, spot: float) -> pd.Series | None:
+    """1-minute stock prices around the valuation session, only if the regular session ends at the spot.
+
+    Keeps the first minutes after the close too, because ETF options trade until 16:15.
+    """
+    if path is None or len(path) == 0:
+        return None
+    day = path[(path.index.date == val.date()) & (path.index <= val + LATE_OPTIONS_SESSION)]
+    regular = day[day.index < val + pd.Timedelta(minutes=1)]
+    if len(regular) < 10:
+        return None
+    if (val - regular.index[-1]) > pd.Timedelta(minutes=10) or abs(float(regular.iloc[-1]) / spot - 1) > 0.005:
+        return None
+    return day
+
+
 def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, expiry: str | None = None,
             focus: tuple[str, float] | None = None, min_dte: int = 4, term_n: int = 4,
             per_side: int = 6) -> AnalysisResult:
     ticker = ticker.upper().strip()
     now = now or cal.now_ny()
     today = now.date()
+    val = cal.valuation_time(now)
     res = AnalysisResult(ticker=ticker, generated_at=now)
     rep = res.validation
 
@@ -193,7 +221,8 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
         res.errors.append("ข้อมูลราคาย้อนหลังไม่ผ่านการตรวจสอบ — หยุดการวิเคราะห์เพื่อป้องกันผลลัพธ์ผิดพลาด")
         return res
     res.history = hist
-    close = hist["Close"]
+    close = hist["Close"]  # as traded: price levels, ranges, option payoffs
+    adj = hist["AdjClose"]  # dividend-adjusted: return statistics
     last_close = float(close.iloc[-1])
     last_date = hist.index[-1].date()
 
@@ -215,6 +244,7 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
         if srep.failed():
             res.errors.append("ราคาปัจจุบันไม่สอดคล้องกับข้อมูลย้อนหลัง — หยุดการวิเคราะห์")
             return res
+    _check_extended_hours(provider, ticker, spot, val, now, rep)
 
     profile = {}
     try:
@@ -251,16 +281,16 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
     res.q = q
 
     # 4. Market context ------------------------------------------------------------------
-    market_close = None
+    market_close = market_adj = None
     if ticker == MARKET:
-        market_close = close
+        market_close, market_adj = close, adj
     else:
         try:
             mrep, mhist = validate_history(provider.history(MARKET, "10y"), now, area="ตลาด (SPY)")
             if mrep.failed():
                 res.notes.append("ข้อมูล SPY ไม่ผ่านการตรวจสอบ — ไม่ใช้ปัจจัยตลาดในการวิเคราะห์")
             else:
-                market_close = mhist["Close"]
+                market_close, market_adj = mhist["Close"], mhist["AdjClose"]
         except Exception as e:
             res.notes.append(f"ดึงข้อมูล SPY ไม่ได้ ({e}) — ไม่ใช้ปัจจัยตลาด")
     if market_close is not None and len(market_close) > 200:
@@ -274,7 +304,6 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
 
     # 5. Stock statistics ----------------------------------------------------------------
     hi, lo = hist["High"], hist["Low"]
-    last_year = close.iloc[-252:]
     s20, s50, s200 = (sma(close, n).iloc[-1] for n in (20, 50, 200))
     res.stock = StockSummary(
         name=name, spot=spot, spot_time=spot_time, last_date=last_date,
@@ -285,28 +314,41 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
         sma20=float(s20), sma50=float(s50), sma200=float(s200),
         rsi14=float(rsi(close).iloc[-1]),
         atr14_pct=float(atr(hi, lo, close).iloc[-1] / close.iloc[-1]),
-        hv20=hv_close_to_close(close, 20), hv60=hv_close_to_close(close, 60), hv252=hv_close_to_close(close, 252),
-        hv20_percentile=hv_percentile(close, 20, 252),
+        hv20=hv_close_to_close(adj, 20), hv60=hv_close_to_close(adj, 60), hv252=hv_close_to_close(adj, 252),
+        hv20_percentile=hv_percentile(adj, 20, 252),
         parkinson20=hv_parkinson(hi, lo, 20),
-        max_drawdown_1y=max_drawdown(last_year),
-        beta_1y=beta(close, market_close) if market_close is not None and ticker != MARKET else (
+        max_drawdown_1y=max_drawdown(adj.iloc[-252:]),
+        beta_1y=beta(adj, market_adj) if market_adj is not None and ticker != MARKET else (
             1.0 if ticker == MARKET else float("nan")),
         dividend_yield=q,
     )
 
     # 6. Weekly outlook ------------------------------------------------------------------
     try:
-        res.weekly = weekly_outlook(close, market_close)
+        res.weekly = weekly_outlook(adj, market_adj)
     except Exception as e:
         res.notes.append(f"คำนวณสถิติรายสัปดาห์ไม่ได้: {e}")
 
-    # 7. Earnings ---------------------------------------------------------------------------
+    # 7. Earnings, relative to the moment the prices refer to ----------------------------
     try:
         res.earnings = provider.earnings(ticker)
     except Exception:
         res.earnings = EarningsInfo("unknown")
-    if res.earnings.past:
-        res.earnings_moves = _earnings_moves(close, res.earnings.past)
+    events = res.earnings.events
+    nxt = earn_mod.upcoming(events, val)
+    res.next_earnings = nxt[0] if nxt else None
+    res.earnings_moves = earn_mod.reactions(close, earn_mod.past(events, val))
+    earnings_stale = False
+    for e in events:
+        rel = earn_mod.released_between(e, val, now)
+        if rel == "yes":
+            earnings_stale = True
+            rep.add("งบการเงิน", "งบออกหลังราคาที่ใช้", FAIL,
+                    f"ประกาศงบ {e.date} ({earn_mod.TIMING_TH[e.timing]}) หลังราคาปิด {val:%Y-%m-%d %H:%M} ET ที่ใช้คำนวณ "
+                    "— ราคาเปิดตลาดรอบหน้าและราคาออปชั่นจะเปลี่ยนมาก")
+        elif rel == "maybe":
+            rep.add("งบการเงิน", "งบออกหลังราคาที่ใช้", WARN,
+                    f"อาจมีประกาศงบ {e.date} หลังราคาปิดที่ใช้คำนวณ (ไม่ทราบเวลาแน่นอน) — ตรวจข่าวก่อนตัดสินใจ")
 
     # 8. Options ---------------------------------------------------------------------------
     try:
@@ -315,7 +357,13 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
         res.notes.append(f"ดึงรายการวันหมดอายุออปชั่นไม่ได้: {e}")
         return res
     if not res.expirations:
-        res.notes.append("หุ้นตัวนี้ไม่มีออปชั่นซื้อขาย (หรือแหล่งข้อมูลไม่ส่งมา)")
+        res.notes.append("แหล่งข้อมูลไม่ส่งรายการออปชั่นมา — หุ้นนี้อาจไม่มีออปชั่น หรือ Yahoo จำกัดการเข้าถึงชั่วคราว "
+                         "(ลองใหม่ในอีกสักครู่)")
+        if focus:
+            res.errors.append(f"ประเมิน {focus[0].upper()} {focus[1]:g} ไม่ได้ เพราะไม่ได้รับข้อมูลออปชั่นของ {ticker}")
+        return res
+    if earnings_stale:
+        res.errors.append("มีการประกาศงบหลังราคาที่ใช้คำนวณ — ไม่แสดงการประเมินออปชั่น รอราคาหลังเปิดตลาดแล้วรันใหม่")
         return res
     chosen, msg = _choose_expiry(res.expirations, today, expiry, min_dte)
     if chosen is None:
@@ -323,8 +371,14 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
         return res
 
     last_session = cal.last_session_with_data(now)
-    val = cal.valuation_time(now)
+    market_open = cal.market_is_open(now)
     res.valuation_time = val
+    path = None
+    if hasattr(provider, "intraday"):
+        try:
+            path = provider.intraday(ticker)
+        except Exception:
+            path = None
     to_fetch = [chosen] + [e for e in res.expirations if e != chosen and dt.date.fromisoformat(e) > today][:term_n]
     for e in to_fetch:
         e_date = dt.date.fromisoformat(e)
@@ -342,7 +396,16 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
                 res.errors.append("ราคาหุ้นจากแต่ละแหล่งไม่ตรงกัน — ไม่แสดงการประเมินออปชั่นเพื่อป้องกันข้อมูลผิดพลาด")
                 return res
         chain_spot = uq.price if uq.price and abs(uq.price / spot - 1) <= 0.05 else spot
-        ch = build_chain(calls, puts, chain_spot, T, r, q, last_session)
+        day_path = _usable_path(path, val, chain_spot)
+        if e == chosen and not market_open:
+            if day_path is not None:
+                rep.add("ออปชั่น", "ราคาหุ้นรายนาที", PASS,
+                        f"ใช้ราคาหุ้นรายนาที {len(day_path)} จุดตรวจว่าราคาซื้อขายล่าสุดของออปชั่นยังตรงกับราคาปิด")
+            else:
+                rep.add("ออปชั่น", "ราคาหุ้นรายนาที", WARN,
+                        "ไม่มีราคาหุ้นรายนาทีที่ใช้ได้ — ใช้เฉพาะราคาออปชั่นที่ซื้อขายใน 15 นาทีสุดท้ายก่อนปิด")
+        ch = build_chain(calls, puts, chain_spot, T, r, q, last_session, val_time=val, market_open=market_open,
+                         spot_path=day_path)
         crep = validate_chain(ch, chain_spot, T, r, q, last_session)
         if e == chosen:
             rep.extend(crep)
@@ -350,8 +413,9 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
             if crep.failed():
                 res.errors.append("ข้อมูลออปชั่นไม่ผ่านการตรวจสอบ — ไม่แสดงการประเมินสัญญาเพื่อป้องกันข้อมูลผิดพลาด")
                 return res
-            _fill_expiry(res, ch, chain_spot, e_date, T, today, val.date(), close, r)
-            _evaluate_contracts(res, ch, chain_spot, e_date, T, today, val.date(), close, r, q, focus, per_side)
+            sessions = cal.sessions_remaining(val, e_date)
+            _fill_expiry(res, ch, chain_spot, e_date, T, sessions, today, close, r)
+            _evaluate_contracts(res, ch, chain_spot, e_date, T, sessions, val, today, close, r, q, focus, per_side)
         elif crep.failed():
             res.notes.append(f"ไม่แสดง IV ของวันหมดอายุ {e} ใน term structure เพราะข้อมูลไม่ผ่านการตรวจสอบ")
             continue
@@ -362,21 +426,41 @@ def analyze(ticker: str, provider: Provider, now: dt.datetime | None = None, exp
     return res
 
 
-def _fill_expiry(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.date, T: float,
-                 today: dt.date, val_date: dt.date, close: pd.Series, r: float) -> None:
-    sessions = max(cal.trading_days_between(val_date, e_date), 1)
+def iv_to_trading_basis(T: float, sessions: float) -> float:
+    """Factor turning a calendar-time IV (T in years of 365 days) into a per-trading-day IV.
+
+    Total variance is the same: sigma^2 * T = sigma_td^2 * sessions / 252. HV is annualised
+    over trading days, so only the restated IV can be compared with it.
+    """
+    if T <= 0 or sessions <= 0:
+        return float("nan")
+    return math.sqrt(T * 252.0 / sessions)
+
+
+def _price_basis(ch: pd.DataFrame) -> str:
+    src = set(ch.loc[ch["usable"], "price_source"])
+    return "mixed" if len(src) > 1 else (src.pop() if src else "none")
+
+
+def _fill_expiry(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.date, T: float, sessions: float,
+                 today: dt.date, close: pd.Series, r: float) -> None:
+    horizon = max(1, round(sessions))
     iv = atm_iv(ch, spot)
     st = atm_straddle(ch, spot)
     hist_p, hist_n = float("nan"), 0
     if st is not None:
-        rets = horizon_log_returns(close, sessions, 5 * 252)
+        rets = horizon_log_returns(close, horizon, 5 * 252)
         hist_n = len(rets)
         if hist_n:
             hist_p = float((np.abs(np.expm1(rets)) > st[1] / spot).mean())
     oi = ch.groupby("kind")["oi"].sum() if oi_available(ch) else pd.Series(dtype=float)
     vol = ch.groupby("kind")["volume"].sum()
+    hv20 = res.stock.hv20
+    factor = iv_to_trading_basis(T, sessions)
     res.selected = ExpiryInfo(
         expiry=e_date, dte=(e_date - today).days, sessions=sessions, T=T, spot=spot, atm_iv=iv,
+        iv_hv20=iv * factor / hv20 if math.isfinite(iv) and math.isfinite(hv20) and hv20 > 0 else float("nan"),
+        price_basis=_price_basis(ch),
         straddle_strike=st[0] if st else None, straddle_price=st[1] if st else None,
         expected_move_iv=expected_move(spot, iv, T) if math.isfinite(iv) else float("nan"),
         implied_prob_up=implied_prob_above(ch, spot, T, r),
@@ -388,16 +472,19 @@ def _fill_expiry(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.
 
 
 def _evaluate_contracts(res: AnalysisResult, ch: pd.DataFrame, spot: float, e_date: dt.date, T: float,
-                        today: dt.date, val_date: dt.date, close: pd.Series, r: float, q: float,
+                        sessions: float, val: dt.datetime, today: dt.date, close: pd.Series, r: float, q: float,
                         focus: tuple[str, float] | None, per_side: int) -> None:
     st = res.stock
     sma50 = st.sma50 if math.isfinite(st.sma50) else None
     sma200 = st.sma200 if math.isfinite(st.sma200) else None
     earn = res.earnings or EarningsInfo("unknown")
+    hits = [e.date for e in earn.events if earn_mod.can_move_between(e, val, cal.expiry_close(e_date))]
     ctx = Context(
         spot=spot, r=r, q=q, T=T, expiry=e_date, today=today,
-        sessions=max(cal.trading_days_between(val_date, e_date), 1), close=close, oi_available=oi_available(ch),
-        hv20=st.hv20, hv60=st.hv60, earnings_status=earn.status, earnings_dates=earn.upcoming,
+        sessions=sessions, close=close, oi_available=oi_available(ch),
+        hv20=st.hv20, hv60=st.hv60, earnings_status=earn.status, earnings_hits=hits,
+        next_earnings=res.next_earnings.date if res.next_earnings else None,
+        iv_factor=iv_to_trading_basis(T, sessions),
         above_sma50=None if sma50 is None else spot > sma50,
         above_sma200=None if sma200 is None else spot > sma200,
         lean=res.weekly.lean if res.weekly else "NEUTRAL",

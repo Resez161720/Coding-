@@ -9,7 +9,8 @@ from . import calendar_us as cal
 from .analysis import AnalysisResult
 from .chain import oi_available
 from .contracts import ContractEval
-from .fmt import DISCLAIMER, STATUS_TH, earnings_note, money, num, ok, pct, vol_points
+from .fmt import (DISCLAIMER, STATUS_TH, earnings_moves_text, iv_basis_text, money, next_earnings_text, num, ok,
+                  pct, sessions_text, vol_points)
 from .validation import FAIL, PASS, WARN
 from .weekly import FEATURE_LABELS, LEAN_LABELS
 
@@ -43,7 +44,7 @@ th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:right;white
 th{color:var(--text2);font-weight:600;background:var(--surface);position:sticky;top:0}
 td.l,th.l{text-align:left;white-space:normal}
 .scroll{overflow-x:auto}
-.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;
+.badge{display:inline-block;white-space:nowrap;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;
 border:1px solid currentColor}
 .good{color:var(--good)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 .lean{font-size:18px;font-weight:700}
@@ -94,10 +95,11 @@ def _charts(res: AnalysisResult) -> list[str]:
                             line=dict(color=color, width=2))
         e = res.selected
         if e is not None and ok(e.expected_move_iv):
-            for lvl, label in ((e.spot + e.expected_move_iv, "+1 SD"), (e.spot - e.expected_move_iv, "−1 SD")):
+            for lvl, label, pos in ((e.spot + e.expected_move_iv, "+1 SD", "top left"),
+                                    (e.spot - e.expected_move_iv, "−1 SD", "bottom left")):
                 fig.add_hline(y=lvl, line=dict(color=MUTED, width=1, dash="dot"),
                               annotation_text=f"{label} ถึง {e.expiry}: {lvl:,.2f}",
-                              annotation_font_color=MUTED)
+                              annotation_position=pos, annotation_font_color=MUTED)
         fig.update_layout(**_layout("ราคา 1 ปีล่าสุด (ปรับปันผล/แตกพาร์) และกรอบคาดการณ์ ±1 SD", "", "ราคา"))
         figs.append(fig)
 
@@ -124,13 +126,16 @@ def _charts(res: AnalysisResult) -> list[str]:
         fig = go.Figure()
         # Out-of-the-money side only: deep in-the-money quotes have tiny vega, so cent rounding distorts their IV.
         for kind, color, name in (("call", BLUE, "Call"), ("put", ORANGE, "Put")):
-            s = u[(u["kind"] == kind) & ((u["strike"] >= spot * 0.98) if kind == "call" else (u["strike"] <= spot * 1.02))]
+            # |delta| 0.05-0.95: penny-priced tails have unreliable IVs and would swamp the scale.
+            s = u[(u["kind"] == kind) & ((u["strike"] >= spot * 0.98) if kind == "call" else (u["strike"] <= spot * 1.02))
+                  & u["delta"].abs().between(0.05, 0.95)]
             fig.add_scatter(x=s["strike"], y=s["iv"] * 100, mode="lines+markers", name=name,
                             line=dict(color=color, width=2), marker=dict(size=8, color=color))
         _min_iv_window(fig, list(u.loc[u["strike"].between(spot * 0.8, spot * 1.2), "iv"] * 100))
         fig.add_vline(x=res.selected.spot, line=dict(color=MUTED, width=1, dash="dot"),
                       annotation_text=f"ราคาหุ้น {res.selected.spot:,.2f}", annotation_font_color=MUTED)
-        fig.update_layout(**_layout(f"IV ตาม strike ฝั่ง OTM (หมดอายุ {res.selected.expiry}) — คำนวณเองจากราคากลาง",
+        fig.update_layout(**_layout(f"IV ตาม strike ฝั่ง OTM (หมดอายุ {res.selected.expiry}) — "
+                                    f"{iv_basis_text(res.selected.price_basis)}",
                                     "Strike", "IV (%)", hovermode="closest"))
         figs.append(fig)
 
@@ -262,9 +267,8 @@ def _options_html(res: AnalysisResult) -> str:
     e = res.selected
     if e is None:
         return ""
-    s = res.stock
     cards = [
-        _stat("ATM IV", pct(e.atm_iv), f"IV ÷ HV20 = {num(e.atm_iv / s.hv20) if ok(s.hv20) and s.hv20 else 'n/a'}"),
+        _stat("ATM IV", pct(e.atm_iv), f"IV ÷ HV20 (ฐานวันทำการ) = {num(e.iv_hv20)}"),
         _stat("กรอบ ±1 SD (IV)", f"±{num(e.expected_move_iv)}" if ok(e.expected_move_iv) else "n/a",
               f"±{pct(e.expected_move_iv / e.spot)} → {num(e.spot - e.expected_move_iv)}–{num(e.spot + e.expected_move_iv)}"
               if ok(e.expected_move_iv) else ""),
@@ -273,22 +277,21 @@ def _options_html(res: AnalysisResult) -> str:
         cards.append(_stat("Straddle ATM", num(e.straddle_price), f"strike {num(e.straddle_strike)}, "
                            f"±{pct(e.straddle_price / e.spot)}"))
         cards.append(_stat("อดีตเคลื่อนไหวเกิน straddle", pct(e.hist_prob_exceed_straddle),
-                           f"{e.sessions} วันทำการ, 5 ปีล่าสุด"))
+                           f"{max(1, round(e.sessions))} วันทำการ, 5 ปีล่าสุด"))
     cards += [_stat("Put/Call OI", num(e.put_call_oi), f"Volume {num(e.put_call_volume)}"),
               _stat("Skew 25Δ (Put−Call)", vol_points(e.skew_25d), "")]
-    earn = res.earnings
-    if earn is not None:
-        val = "ไม่มี (ETF)" if earn.status == "none" else (str(earn.upcoming[0]) if earn.upcoming else "ยืนยันไม่ได้")
-        moves = earnings_note(earn.confirmed) + ". " if earn.upcoming else ""
-        if res.earnings_moves:
-            avg = sum(abs(m) for _, m in res.earnings_moves) / len(res.earnings_moves)
-            moves += f"หลังงบ {len(res.earnings_moves)} ครั้งล่าสุด เคลื่อนไหวเฉลี่ย ±{pct(avg)}"
-        cards.append(_stat("ประกาศงบครั้งถัดไป", val, moves))
+    if res.earnings is not None:
+        nxt = res.next_earnings
+        cards.append(_stat("ประกาศงบครั้งถัดไป", str(nxt.date) if nxt else next_earnings_text(res),
+                           next_earnings_text(res) if nxt else ""))
+    avg, items, note = earnings_moves_text(res.earnings_moves)
+    if avg:
+        cards.append(_stat(f"เคลื่อนไหวหลังงบ ({len(res.earnings_moves)} ครั้ง)", avg, f"{items} — {note}"))
     closed = ""
     if res.valuation_time is not None and res.valuation_time != res.generated_at:
         closed = (f'<p class="note">ตลาดปิดอยู่: ราคาหุ้นและออปชั่นเป็นราคา ณ ปิดตลาด '
                   f"{res.valuation_time:%Y-%m-%d %H:%M} ET และคำนวณเวลาถึงวันหมดอายุจากจุดนั้น</p>")
-    return (f"<h2>4. ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / เหลือ {e.sessions} วันทำการ)</h2>{closed}"
+    return (f"<h2>4. ออปชั่นหมดอายุ {e.expiry} ({e.dte} วัน / เหลือ {sessions_text(e.sessions)} วันทำการ)</h2>{closed}"
             f'<div class="grid">{"".join(cards)}</div>')
 
 
@@ -348,7 +351,7 @@ def render(res: AnalysisResult) -> str:
     parts = [
         f"<h1>{_e(res.ticker)} — {_e(name)}</h1>",
         f'<div class="sub">รายงานวิเคราะห์ก่อนซื้อออปชั่น | สร้างเมื่อ {_e(cal.stamp(res.generated_at))} '
-        f"| ข้อมูล Yahoo Finance | อัตราดอกเบี้ย {pct(res.r, 2)} ({_e(res.r_source)}) | "
+        f"| ข้อมูล Yahoo Finance | อัตราดอกเบี้ย {pct(res.r, 2) if res.r_source else 'n/a'} ({_e(res.r_source)}) | "
         f"ปันผล {pct(res.q, 2)}</div>",
         _validation_html(res),
     ]
@@ -376,7 +379,7 @@ def render_scan(rows: list[AnalysisResult]) -> str:
             f"<td>{pct(m.prob_up) if m else 'n/a'}</td><td>{'ใช่' if m and m.validated else 'ไม่'}</td>"
             f"<td>{pct(e.implied_prob_up) if e else 'n/a'}</td>"
             f"<td>{('±' + pct(e.expected_move_iv / e.spot)) if e and ok(e.expected_move_iv) else 'n/a'}</td>"
-            f"<td>{num(e.atm_iv / s.hv20) if e and ok(e.atm_iv) and ok(s.hv20) and s.hv20 else 'n/a'}</td>"
+            f"<td>{num(e.iv_hv20) if e else 'n/a'}</td>"
             f'<td class="l {cls}">{_e(LEAN_LABELS[w.lean])}</td></tr>')
     table = ('<div class="card scroll"><table><tr><th class="l">หุ้น</th><th>ราคา</th><th>สัปดาห์ขึ้น (อดีต)</th>'
              "<th>โมเดล P(ขึ้น)</th><th>โมเดลผ่านทดสอบ</th><th>ตลาดออปชั่น P(ขึ้น)</th><th>กรอบ ±1 SD</th>"
