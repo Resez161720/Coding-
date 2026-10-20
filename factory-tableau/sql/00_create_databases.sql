@@ -7,6 +7,10 @@
    รันซ้ำได้ ไม่ลบของเดิม
    ===================================================================== */
 
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+
 IF DB_ID(N'FactoryBI') IS NULL
     CREATE DATABASE FactoryBI;
 GO

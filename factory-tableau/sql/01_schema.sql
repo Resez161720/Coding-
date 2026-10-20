@@ -7,7 +7,12 @@
    ต้องใช้ SQL Server 2016 SP1 ขึ้นไป
 
    หลักการเก็บเวลา: ทุกคอลัมน์วันเวลาเก็บเป็น "เวลาไทย" (UTC+7) ไม่ใช่ UTC
+                   (ค่าเริ่มต้นของ created_at / updated_at แปลงเป็นเวลาไทยให้เอง แม้เครื่องจะตั้งเป็น UTC)
    ===================================================================== */
+
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
 
 IF DB_NAME() IN (N'master', N'model', N'msdb', N'tempdb')
 BEGIN
@@ -95,19 +100,22 @@ GO
    --------------------------------------------------------------------- */
 
 -- นิยามกะ: เวลาเริ่มต้องตรงชั่วโมงพอดี (เช่น 08:00) และความยาวกะเป็นชั่วโมงเต็ม
--- start_day_offset: กะที่เริ่มหลังเที่ยงคืนแต่นับเป็นวันผลิตของเมื่อวาน ให้ใส่ 1
+-- start_day_offset: วันที่เริ่มกะ เทียบกับวันผลิต
+--    0 = เริ่มในวันผลิตนั้น (ปกติ) เช่น กะดึก 20:00 ของวันที่ 20 = วันผลิต 20
+--    1 = เริ่มหลังเที่ยงคืน แต่นับเป็นวันผลิตของเมื่อวาน เช่น กะ 00:00 ของวันที่ 21 = วันผลิต 20
+--   -1 = เริ่มก่อนเที่ยงคืน แต่นับเป็นกะแรกของวันผลิตถัดไป เช่น กะ 23:00 ของวันที่ 19 = วันผลิต 20
 IF OBJECT_ID(N'mfg.shift_definition', N'U') IS NULL
 CREATE TABLE mfg.shift_definition (
     shift_code       NVARCHAR(10) NOT NULL CONSTRAINT PK_shift_definition PRIMARY KEY,
     shift_name_th    NVARCHAR(50) NOT NULL,
     start_time       TIME(0)      NOT NULL,
     duration_min     INT          NOT NULL,
-    start_day_offset TINYINT      NOT NULL CONSTRAINT DF_shift_offset DEFAULT (0),
+    start_day_offset SMALLINT     NOT NULL CONSTRAINT DF_shift_offset DEFAULT (0),
     sort_order       INT          NOT NULL CONSTRAINT DF_shift_sort DEFAULT (1),
     is_active        BIT          NOT NULL CONSTRAINT DF_shift_active DEFAULT (1),
     CONSTRAINT CK_shift_start_on_hour CHECK (DATEPART(MINUTE, start_time) = 0 AND DATEPART(SECOND, start_time) = 0),
     CONSTRAINT CK_shift_duration CHECK (duration_min BETWEEN 60 AND 1440 AND duration_min % 60 = 0),
-    CONSTRAINT CK_shift_offset CHECK (start_day_offset IN (0, 1))
+    CONSTRAINT CK_shift_offset CHECK (start_day_offset IN (-1, 0, 1))
 );
 GO
 
@@ -155,7 +163,7 @@ CREATE TABLE mfg.production_plan (
     sku             NVARCHAR(40)  NOT NULL,
     plan_qty        INT           NOT NULL CONSTRAINT CK_plan_qty CHECK (plan_qty >= 0),
     source          NVARCHAR(20)  NOT NULL CONSTRAINT DF_plan_source DEFAULT (N'MANUAL'),
-    updated_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_plan_updated DEFAULT (SYSDATETIME()),
+    updated_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_plan_updated DEFAULT (CAST(SWITCHOFFSET(SYSDATETIMEOFFSET(), '+07:00') AS DATETIME2(0))),
     CONSTRAINT PK_production_plan PRIMARY KEY (prod_date, shift_code, machine_id, sku),
     CONSTRAINT FK_plan_calendar FOREIGN KEY (prod_date, shift_code) REFERENCES mfg.shift_calendar (prod_date, shift_code)
 );
@@ -171,7 +179,7 @@ CREATE TABLE mfg.production_hour (
     total_qty       INT           NOT NULL CONSTRAINT CK_prod_total CHECK (total_qty >= 0),   -- ผลิตทั้งหมด (ดี+เสีย)
     good_qty        INT           NOT NULL CONSTRAINT CK_prod_good CHECK (good_qty >= 0),     -- ของดี
     source          NVARCHAR(20)  NOT NULL CONSTRAINT DF_prod_source DEFAULT (N'MANUAL'),     -- PLC / FORM / IMPORT / MANUAL
-    updated_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_prod_updated DEFAULT (SYSDATETIME()),
+    updated_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_prod_updated DEFAULT (CAST(SWITCHOFFSET(SYSDATETIMEOFFSET(), '+07:00') AS DATETIME2(0))),
     CONSTRAINT PK_production_hour PRIMARY KEY (machine_id, hour_start, sku),
     CONSTRAINT CK_prod_good_le_total CHECK (good_qty <= total_qty),
     CONSTRAINT CK_prod_on_hour CHECK (DATEPART(MINUTE, hour_start) = 0 AND DATEPART(SECOND, hour_start) = 0)
@@ -192,8 +200,8 @@ CREATE TABLE mfg.downtime_event (
     reason_code     NVARCHAR(20)  NULL CONSTRAINT FK_dt_reason REFERENCES mfg.downtime_reason (reason_code),
     note            NVARCHAR(400) NULL,
     source          NVARCHAR(20)  NOT NULL CONSTRAINT DF_dt_source DEFAULT (N'MANUAL'),
-    created_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_dt_created DEFAULT (SYSDATETIME()),
-    updated_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_dt_updated DEFAULT (SYSDATETIME()),
+    created_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_dt_created DEFAULT (CAST(SWITCHOFFSET(SYSDATETIMEOFFSET(), '+07:00') AS DATETIME2(0))),
+    updated_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_dt_updated DEFAULT (CAST(SWITCHOFFSET(SYSDATETIMEOFFSET(), '+07:00') AS DATETIME2(0))),
     CONSTRAINT CK_dt_range CHECK (end_ts IS NULL OR end_ts > start_ts)
 );
 GO

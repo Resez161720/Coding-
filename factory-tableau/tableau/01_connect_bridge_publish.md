@@ -30,15 +30,16 @@ Tableau Cloud อยู่บนอินเทอร์เน็ต มอง�
 
 ข้อจำกัดที่ควรรู้ของ Bridge: query แบบ Live หมดเวลาที่ 15 นาที และต่อได้พร้อมกัน 16 query ต่อเครื่อง Bridge — view ในชุดนี้เบามาก ไม่เป็นปัญหา
 
-## ค. สร้าง Data Source 3 ตัว แล้ว Publish
+## ค. สร้าง Data Source 4 ตัว แล้ว Publish
 
-ทำใน **Tableau Desktop** (ต้องมีไลเซนส์ Creator) แยก 3 data source ตามงาน:
+ทำใน **Tableau Desktop** (ต้องมีไลเซนส์ Creator) แยก 4 data source ตามงาน:
 
 | ชื่อ Data Source (แนะนำ) | ตารางหลัก | เชื่อม (Relationship) กับ | ใช้ทำ | แบบ |
 |---|---|---|---|---|
 | `FAC - OEE by Shift` | `rpt.v_oee_shift` | `rpt.v_machine` ด้วย `machine_id` | Dashboard OEE/คอขวด, รายงานเช้า | Extract |
 | `FAC - Plan vs Actual Hourly` | `rpt.v_plan_vs_actual_hour` | `rpt.v_machine` ด้วย `machine_id` | Dashboard แผน vs จริง, จอทีวี, แจ้งเตือน | Live (ถ้าทำจอทีวี) หรือ Extract |
 | `FAC - Downtime` | `rpt.v_downtime_segment` | `rpt.v_machine` ด้วย `machine_id` | Pareto สาเหตุหยุด, MTTR | Extract |
+| `FAC - Plan Capacity` | `rpt.v_plan_capacity` | `rpt.v_machine` ด้วย `machine_id` | แผนข้างหน้าเกินกำลังไหม (ฝ่ายวางแผน) | Extract |
 
 (เสริม: `rpt.v_plan_vs_actual_sku` สำหรับดูแผนต่อสินค้า, `rpt.v_data_quality` สำหรับหน้า Data Health)
 

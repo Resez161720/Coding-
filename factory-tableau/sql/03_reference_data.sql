@@ -7,6 +7,10 @@
    รันซ้ำได้: เพิ่มเฉพาะรายการที่ยังไม่มี ไม่ทับของเดิม
    ===================================================================== */
 
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+
 IF DB_NAME() IN (N'master', N'model', N'msdb', N'tempdb')
 BEGIN
     RAISERROR(N'กรุณาเลือกฐานข้อมูลของโรงงาน (เช่น FactoryBI) ก่อนรันสคริปต์นี้', 16, 1);
@@ -22,14 +26,29 @@ SELECT v.shift_code, v.shift_name_th, v.start_time, v.duration_min, v.start_day_
 FROM (VALUES
     (N'D', N'กะเช้า', CAST('08:00' AS TIME(0)), 720, 0, 1),
     (N'N', N'กะดึก', CAST('20:00' AS TIME(0)), 720, 0, 2)
-    /* ถ้าเป็น 3 กะ x 8 ชม. ให้ใช้ชุดนี้แทน 2 บรรทัดบน
+    /* ถ้าเป็น 3 กะ x 8 ชม. ให้ใช้ชุดนี้แทน 2 บรรทัดบน (และแก้เวลาพักในข้อ 2 ให้ใช้ A/B/C)
     (N'A', N'กะ A', CAST('07:00' AS TIME(0)), 480, 0, 1),
     (N'B', N'กะ B', CAST('15:00' AS TIME(0)), 480, 0, 2),
     (N'C', N'กะ C', CAST('23:00' AS TIME(0)), 480, 0, 3)
+       ถ้าโรงงานนับกะ 23:00 เป็น "กะแรกของวันถัดไป" ให้ใช้ลำดับนี้แทน (ตัวเลข -1 = เริ่มก่อนวันผลิต 1 วัน)
+    (N'C', N'กะ C', CAST('23:00' AS TIME(0)), 480, -1, 1),
+    (N'A', N'กะ A', CAST('07:00' AS TIME(0)), 480, 0, 2),
+    (N'B', N'กะ B', CAST('15:00' AS TIME(0)), 480, 0, 3)
     */
 ) v (shift_code, shift_name_th, start_time, duration_min, start_day_offset, sort_order)
 WHERE NOT EXISTS (SELECT 1 FROM mfg.shift_definition s WHERE s.shift_code = v.shift_code);
 GO
+
+/* ---------------------------------------------------------------------
+   ถ้าเคยรันไฟล์นี้ไปแล้ว และต้องการ "เปลี่ยนรูปแบบกะ" (เช่น จาก 2 กะเป็น 3 กะ)
+   ห้ามรันซ้ำเฉย ๆ เพราะกะใหม่จะซ้อนกะเดิม (ระบบจะยกเลิกและแจ้งเตือน) ให้ทำตามนี้ก่อน:
+     DECLARE @change_date DATE = '2026-11-01';            -- วันแรกที่ใช้กะแบบใหม่
+     UPDATE mfg.shift_definition SET is_active = 0 WHERE shift_code IN (N'D', N'N');
+     DELETE c FROM mfg.shift_calendar c
+     WHERE  c.shift_code IN (N'D', N'N') AND c.prod_date >= @change_date
+       AND  NOT EXISTS (SELECT 1 FROM mfg.production_plan p WHERE p.prod_date = c.prod_date AND p.shift_code = c.shift_code);
+   แล้วเพิ่มกะใหม่ + เวลาพักใหม่ และรัน mfg.usp_build_shift_calendar @date_from = @change_date, ...
+   --------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------
    2) เวลาพัก: offset_min = เริ่มพักหลังเริ่มกะกี่นาที
@@ -75,7 +94,8 @@ WHERE NOT EXISTS (SELECT 1 FROM mfg.downtime_reason r WHERE r.reason_code = v.re
 GO
 
 /* ---------------------------------------------------------------------
-   4) วันหยุดโรงงาน (ตัวอย่าง — ใส่ตามปฏิทินของโรงงานเองก่อนสร้างปฏิทินกะ)
+   4) วันหยุดโรงงาน (ตัวอย่าง — ใส่ตามปฏิทินของโรงงาน)
+      ใส่ภายหลังก็ได้ แล้วรัน mfg.usp_build_shift_calendar ช่วงวันที่นั้นซ้ำ ระบบจะปิดกะวันหยุดให้
    --------------------------------------------------------------------- */
 /*
 INSERT INTO mfg.holiday (holiday_date, holiday_name) VALUES

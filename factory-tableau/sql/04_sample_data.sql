@@ -14,6 +14,10 @@
      - การหยุดบางครั้งยังไม่ระบุสาเหตุ และบางครั้งคร่อมข้ามกะ
    ===================================================================== */
 
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+
 IF DB_NAME() IN (N'master', N'model', N'msdb', N'tempdb') OR DB_NAME() NOT LIKE N'%Demo%'
 BEGIN
     RAISERROR(N'ข้อมูลตัวอย่างใส่ได้เฉพาะฐานข้อมูลที่ชื่อมีคำว่า Demo (เช่น FactoryBI_Demo) เพื่อไม่ให้ปนกับข้อมูลจริง', 16, 1);
@@ -86,7 +90,7 @@ JOIN    @sku s ON s.prefix = LEFT(m.machine_id, 3);
 INSERT INTO mfg.production_plan (prod_date, shift_code, machine_id, sku, plan_qty, source)
 SELECT  c.prod_date, c.shift_code, m.machine_id, s.sku,
         CAST(FLOOR(c.planned_min * 60.0 / ct.ideal_ct_sec
-                   * CASE WHEN m.machine_id IN (N'CNC-03', N'PRS-02') THEN 0.97 ELSE 0.78 END) AS INT),
+                   * CASE WHEN m.machine_id IN (N'CNC-03', N'PRS-02') THEN 0.97 ELSE 0.68 END) AS INT),
         N'SAMPLE'
 FROM    mfg.v_shift_calendar c
 CROSS JOIN mfg.machine m

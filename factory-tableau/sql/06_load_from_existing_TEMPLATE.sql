@@ -16,6 +16,10 @@
          sqlcmd -S <ชื่อเซิร์ฟเวอร์> -d FactoryBI -E -Q "EXEC mfg.usp_load_from_existing"
    ===================================================================== */
 
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+
 IF DB_NAME() IN (N'master', N'model', N'msdb', N'tempdb')
 BEGIN
     RAISERROR(N'กรุณาเลือกฐานข้อมูลของโรงงาน (เช่น FactoryBI) ก่อนรันสคริปต์นี้', 16, 1);
@@ -32,7 +36,10 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    DECLARE @since DATETIME2(0) = DATEADD(DAY, -@days_back, (SELECT now_local FROM mfg.v_now));
+    DECLARE @now   DATETIME2(0) = (SELECT now_local FROM mfg.v_now);
+    DECLARE @since DATETIME2(0) = DATEADD(DAY, -@days_back, @now);
+    -- ปัดลงเป็นต้นชั่วโมง เพื่อให้ชั่วโมงแรกของช่วงที่ดึง ได้ยอดครบทั้งชั่วโมง (ไม่งั้นจะเขียนทับด้วยยอดครึ่งชั่วโมง)
+    SET @since = DATEADD(HOUR, DATEDIFF(HOUR, CAST('2000-01-01' AS DATETIME2(0)), @since), CAST('2000-01-01' AS DATETIME2(0)));
 
     BEGIN TRANSACTION;
 
@@ -52,7 +59,7 @@ BEGIN
     ) AS s
     ON  t.machine_id = s.machine_id AND t.hour_start = s.hour_start AND t.sku = s.sku
     WHEN MATCHED AND (t.total_qty <> s.total_qty OR t.good_qty <> s.good_qty) THEN
-        UPDATE SET total_qty = s.total_qty, good_qty = s.good_qty, source = N'IMPORT', updated_at = SYSDATETIME()
+        UPDATE SET total_qty = s.total_qty, good_qty = s.good_qty, source = N'IMPORT', updated_at = @now
     WHEN NOT MATCHED BY TARGET THEN
         INSERT (machine_id, hour_start, sku, total_qty, good_qty, source)
         VALUES (s.machine_id, s.hour_start, s.sku, s.total_qty, s.good_qty, N'IMPORT');
@@ -73,11 +80,16 @@ BEGIN
                     (N'<<รหัสเดิม 1>>', N'BD-MECH'),
                     (N'<<รหัสเดิม 2>>', N'SETUP')
                   ) map (old_code, reason_code) ON map.old_code = src.<<stop_reason_col>>
-        WHERE   src.<<stop_start_col>> >= @since OR src.<<stop_end_col>> IS NULL
+        WHERE   src.<<stop_start_col>> >= @since
+           OR   src.<<stop_end_col>> IS NULL
+           OR   src.<<stop_end_col>> >= @since
+           -- การหยุดที่ยังเปิดค้างใน mfg (เริ่มก่อนช่วงที่ดึง) ต้องดึงมาปิดด้วย
+           OR   EXISTS (SELECT 1 FROM mfg.downtime_event o
+                        WHERE o.source_ref = CAST(src.<<stop_id_col>> AS NVARCHAR(100)) AND o.end_ts IS NULL)
     ) AS s
     ON  t.source_ref = s.source_ref
     WHEN MATCHED THEN
-        UPDATE SET end_ts = s.end_ts, reason_code = ISNULL(t.reason_code, s.reason_code), updated_at = SYSDATETIME()
+        UPDATE SET end_ts = s.end_ts, reason_code = ISNULL(t.reason_code, s.reason_code), updated_at = @now
     WHEN NOT MATCHED BY TARGET THEN
         INSERT (machine_id, start_ts, end_ts, reason_code, source, source_ref)
         VALUES (s.machine_id, s.start_ts, s.end_ts, s.reason_code, N'IMPORT', s.source_ref);
@@ -104,7 +116,7 @@ USING (
 ) AS s
 ON  t.prod_date = s.prod_date AND t.shift_code = s.shift_code AND t.machine_id = s.machine_id AND t.sku = s.sku
 WHEN MATCHED THEN
-    UPDATE SET plan_qty = s.plan_qty, source = N'EXCEL', updated_at = SYSDATETIME()
+    UPDATE SET plan_qty = s.plan_qty, source = N'EXCEL', updated_at = (SELECT now_local FROM mfg.v_now)
 WHEN NOT MATCHED BY TARGET THEN
     INSERT (prod_date, shift_code, machine_id, sku, plan_qty, source)
     VALUES (s.prod_date, s.shift_code, s.machine_id, s.sku, s.plan_qty, N'EXCEL');

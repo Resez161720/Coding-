@@ -6,13 +6,18 @@
 
    view ที่ Tableau ใช้ (ให้สิทธิ์ tableau_reader อ่านเฉพาะ schema rpt):
      rpt.v_machine               ข้อมูลเครื่องจักร
-     rpt.v_oee_shift             OEE ต่อ เครื่อง x กะ  (Dashboard OEE / คอขวด)
+     rpt.v_oee_shift             OEE ต่อ เครื่อง x กะ  (Dashboard OEE / เวลาหายไปไหน)
      rpt.v_plan_vs_actual_hour   แผนเทียบผลิตจริง รายชั่วโมง (Dashboard แผน vs จริง / จอทีวี)
+     rpt.v_plan_capacity         แผนกะนี้และกะข้างหน้า เทียบกำลังผลิตที่ทำได้จริง (แผนเกินกำลังไหม)
      rpt.v_plan_vs_actual_sku    แผนเทียบผลิตจริง ต่อ เครื่อง x กะ x สินค้า
      rpt.v_downtime_segment      เวลาเครื่องหยุด ตัดตามกะ หักเวลาพักแล้ว (Dashboard Pareto)
      rpt.v_production_hour       ยอดผลิตรายชั่วโมงแบบละเอียด
      rpt.v_data_quality          รายการปัญหาคุณภาพข้อมูล
    ===================================================================== */
+
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
 
 IF DB_NAME() IN (N'master', N'model', N'msdb', N'tempdb')
 BEGIN
@@ -104,9 +109,9 @@ CROSS APPLY mfg.tvf_break_overlap_sec(c.prod_date, c.shift_code, h.hour_start, h
 WHERE   h.hour_end <= c.shift_end;
 GO
 
--- กะล่าสุดนับย้อนหลัง: 0 = กะที่กำลังเดินอยู่ (หรือกะล่าสุดที่เริ่มไปแล้ว), 1 = กะก่อนหน้า, ...
--- นับเฉพาะกะทำงาน (is_working = 1) หรือกะที่มีแผนผลิต ย้อนหลังไม่เกิน 62 วัน
--- ใช้ใน Tableau กรอง "กะปัจจุบัน" / "กะที่แล้ว" ได้ตรงเสมอ แม้กะดึกจะข้ามเที่ยงคืน
+-- กะล่าสุดนับย้อนหลัง: 0 = กะล่าสุดที่เริ่มไปแล้ว (ถ้ากำลังเดินอยู่ก็คือกะนี้), 1 = กะก่อนหน้า, ...
+-- นับเฉพาะกะทำงาน (is_working = 1) หรือกะที่มีแผน/มียอดผลิต ย้อนหลังไม่เกิน 62 วัน
+-- ช่วงก่อนเริ่มกะแรกของวัน หรือวันหยุด: 0 = กะที่จบไปแล้วล่าสุด (ดูคอลัมน์ is_current_shift ประกอบ)
 CREATE OR ALTER VIEW mfg.v_shift_recent
 AS
 SELECT  c.prod_date,
@@ -118,11 +123,13 @@ WHERE   c.shift_start <= n.now_local
   AND   c.shift_start >  DATEADD(DAY, -62, n.now_local)
   AND   (c.is_working = 1
          OR EXISTS (SELECT 1 FROM mfg.production_plan p
-                    WHERE p.prod_date = c.prod_date AND p.shift_code = c.shift_code AND p.plan_qty > 0));
+                    WHERE p.prod_date = c.prod_date AND p.shift_code = c.shift_code AND p.plan_qty > 0)
+         OR EXISTS (SELECT 1 FROM mfg.production_hour ph
+                    WHERE ph.hour_start >= c.shift_start AND ph.hour_start < c.shift_end AND ph.total_qty > 0));
 GO
 
--- เครื่อง x กะ ที่ "มีงาน" = มีแผน หรือ มียอดผลิตจริง
--- เครื่องที่ไม่มีแผนและไม่ได้ผลิต จะไม่ถูกนับเวลาใน OEE (ถือว่าไม่ได้วางแผนให้เดิน)
+-- เครื่อง x กะ ที่ "มีงาน" = มีแผน หรือ มียอดผลิตจริง หรือ (กะทำงานปกติ และ) มีการหยุดที่เป็นความสูญเสีย
+-- เครื่องที่ไม่มีแผน ไม่ได้ผลิต และไม่ได้เสีย จะไม่ถูกนับเวลาใน OEE (ถือว่าไม่ได้วางแผนให้เดิน)
 CREATE OR ALTER VIEW mfg.v_machine_shift_scheduled
 AS
 SELECT  pp.machine_id, pp.prod_date, pp.shift_code
@@ -132,7 +139,18 @@ UNION
 SELECT  p.machine_id, c.prod_date, c.shift_code
 FROM    mfg.production_hour p
 JOIN    mfg.shift_calendar c ON p.hour_start >= c.shift_start AND p.hour_start < c.shift_end
-WHERE   p.total_qty > 0;
+WHERE   p.total_qty > 0
+UNION
+SELECT  e.machine_id, c.prod_date, c.shift_code
+FROM    mfg.downtime_event e
+CROSS JOIN mfg.v_now n
+JOIN    mfg.shift_calendar c
+        ON  e.start_ts < c.shift_end
+        AND (CASE WHEN e.end_ts IS NULL OR e.end_ts > n.now_local THEN n.now_local ELSE e.end_ts END) > c.shift_start
+LEFT JOIN mfg.downtime_reason r ON r.reason_code = e.reason_code
+WHERE   c.is_working = 1
+  AND   e.start_ts < n.now_local
+  AND   ISNULL(r.loss_category, N'UNCODED') <> N'PLANNED';
 GO
 
 /* =====================================================================
@@ -147,58 +165,156 @@ GO
 
 /* เวลาเครื่องหยุด แยกเป็นชิ้นตามกะ
    - การหยุดที่คร่อมกะ จะถูกแบ่งเป็นหลายแถว (แถวละกะ)
-   - downtime_min = เวลาหยุดหลังหักส่วนที่ทับเวลาพักแล้ว
-   - การหยุดที่ยังไม่จบ (end_ts ว่าง) นับถึงเวลาปัจจุบัน
-   - ยังไม่ระบุสาเหตุ -> reason_code = 'UNCODED' และนับเป็นความสูญเสีย */
+   - downtime_min  = เวลาหยุดหลังหักส่วนที่ทับเวลาพักแล้ว (ใช้คิด OEE และ Pareto)
+   - stop_count    = 1 เฉพาะแถวแรกของการหยุดแต่ละครั้งที่มีเวลาหยุดจริง (> 0 นาที)
+                     ใช้นับ "จำนวนครั้ง" — การหยุดที่คร่อมกะนับครั้งเดียว, หยุดอยู่ในเวลาพักทั้งหมดไม่นับ
+   - event_total_min = เวลาหยุดตามนาฬิกาตั้งแต่เริ่มถึงจบ (ใช้คิด MTTR)
+   - การหยุดที่ยังไม่จบ (end_ts ว่าง) หรือเวลาจบอยู่ในอนาคต นับถึงเวลาปัจจุบันเท่านั้น
+   - การหยุดที่ซ้อนทับกันในเครื่องเดียวกัน: ช่วงที่ซ้อนนับให้รายการที่เริ่มก่อน (ไม่นับซ้ำ)
+   - ยังไม่ระบุสาเหตุ -> reason_code = 'UNCODED' และนับเป็นความสูญเสีย
+   - is_scheduled  = 1 ถ้าเครื่อง x กะนั้นถูกนับใน OEE (ใช้กรอง Pareto ให้ตรงกับ OEE) */
 CREATE OR ALTER VIEW rpt.v_downtime_segment
 AS
-SELECT  e.event_id,
-        e.machine_id,
-        c.prod_date,
-        c.shift_code,
-        s.seg_start,
-        s.seg_end,
-        CAST((DATEDIFF(SECOND, s.seg_start, s.seg_end) - bo.overlap_sec) / 60.0 AS DECIMAL(10,2)) AS downtime_min,
-        CAST(bo.overlap_sec / 60.0 AS DECIMAL(10,2))                                              AS break_overlap_min,
-        CASE WHEN e.end_ts IS NULL THEN 1 ELSE 0 END                                              AS is_ongoing,
-        CASE WHEN n.now_local >= c.shift_start AND n.now_local < c.shift_end THEN 1 ELSE 0 END    AS is_current_shift,
+WITH ev AS (
+    SELECT  e.event_id, e.machine_id, e.start_ts, e.end_ts, e.reason_code, e.note,
+            x.eff_end,
+            MAX(x.eff_end) OVER (PARTITION BY e.machine_id ORDER BY e.start_ts, e.event_id
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_end
+    FROM    mfg.downtime_event e
+    CROSS JOIN mfg.v_now n
+    CROSS APPLY (SELECT CASE WHEN e.end_ts IS NULL OR e.end_ts > n.now_local
+                             THEN n.now_local ELSE e.end_ts END AS eff_end) x
+    WHERE   e.start_ts < n.now_local
+),
+ev2 AS (
+    SELECT  ev.*,
+            CASE WHEN ev.prev_end > ev.start_ts THEN ev.prev_end ELSE ev.start_ts END AS eff_start
+    FROM    ev
+),
+seg AS (
+    SELECT  ev2.event_id, ev2.machine_id, ev2.start_ts, ev2.end_ts, ev2.eff_start, ev2.eff_end,
+            ev2.reason_code, ev2.note,
+            c.prod_date, c.shift_code, c.shift_start, c.shift_end, c.is_working,
+            s.seg_start, s.seg_end,
+            DATEDIFF(SECOND, s.seg_start, s.seg_end) - bo.overlap_sec AS net_sec,
+            bo.overlap_sec
+    FROM    ev2
+    JOIN    mfg.shift_calendar c ON ev2.eff_start < c.shift_end AND ev2.eff_end > c.shift_start
+    CROSS APPLY (SELECT CASE WHEN ev2.eff_start > c.shift_start THEN ev2.eff_start ELSE c.shift_start END AS seg_start,
+                        CASE WHEN ev2.eff_end   < c.shift_end   THEN ev2.eff_end   ELSE c.shift_end   END AS seg_end) s
+    CROSS APPLY mfg.tvf_break_overlap_sec(c.prod_date, c.shift_code, s.seg_start, s.seg_end) bo
+    WHERE   ev2.eff_start < ev2.eff_end
+)
+SELECT  seg.event_id,
+        seg.machine_id,
+        seg.prod_date,
+        seg.shift_code,
+        seg.seg_start,
+        seg.seg_end,
+        CAST(seg.net_sec / 60.0 AS DECIMAL(10,2))                                                 AS downtime_min,
+        CAST(seg.overlap_sec / 60.0 AS DECIMAL(10,2))                                             AS break_overlap_min,
+        CASE WHEN seg.net_sec > 0
+              AND SUM(CASE WHEN seg.net_sec > 0 THEN 1 ELSE 0 END)
+                  OVER (PARTITION BY seg.event_id ORDER BY seg.seg_start ROWS UNBOUNDED PRECEDING) = 1
+             THEN 1 ELSE 0 END                                                                    AS stop_count,
+        CASE WHEN seg.end_ts IS NULL THEN 1 ELSE 0 END                                            AS is_ongoing,
+        CASE WHEN n.now_local >= seg.shift_start AND n.now_local < seg.shift_end THEN 1 ELSE 0 END AS is_current_shift,
         sr.shifts_ago,
-        ISNULL(e.reason_code, N'UNCODED')                                                         AS reason_code,
+        CAST(seg.is_working AS INT)                                                               AS is_working,
+        CASE WHEN EXISTS (SELECT 1 FROM mfg.v_machine_shift_scheduled k
+                          WHERE k.machine_id = seg.machine_id AND k.prod_date = seg.prod_date
+                            AND k.shift_code = seg.shift_code) THEN 1 ELSE 0 END                  AS is_scheduled,
+        ISNULL(seg.reason_code, N'UNCODED')                                                       AS reason_code,
         ISNULL(r.reason_name_th, N'ยังไม่ระบุสาเหตุ')                                              AS reason_name_th,
         ISNULL(r.reason_name_en, N'Uncoded')                                                      AS reason_name_en,
         ISNULL(r.loss_category, N'UNCODED')                                                       AS loss_category,
         CASE WHEN r.loss_category = N'PLANNED' THEN 1 ELSE 0 END                                  AS is_planned_stop,
         r.responsible_dept,
-        e.start_ts                                                                                AS event_start_ts,
-        e.end_ts                                                                                  AS event_end_ts,
-        CAST(DATEDIFF(SECOND, e.start_ts, x.eff_end) / 60.0 AS DECIMAL(10,2))                     AS event_total_min,
-        e.note
-FROM    mfg.downtime_event e
+        seg.start_ts                                                                              AS event_start_ts,
+        seg.end_ts                                                                                AS event_end_ts,
+        CAST(DATEDIFF(SECOND, seg.start_ts, seg.eff_end) / 60.0 AS DECIMAL(10,2))                 AS event_total_min,
+        CASE WHEN seg.eff_start > seg.start_ts THEN 1 ELSE 0 END                                  AS is_overlap_trimmed,
+        seg.note
+FROM    seg
 CROSS JOIN mfg.v_now n
-CROSS APPLY (SELECT ISNULL(e.end_ts, n.now_local) AS eff_end) x
-JOIN    mfg.shift_calendar c ON e.start_ts < c.shift_end AND x.eff_end > c.shift_start
-CROSS APPLY (SELECT CASE WHEN e.start_ts > c.shift_start THEN e.start_ts ELSE c.shift_start END AS seg_start,
-                    CASE WHEN x.eff_end  < c.shift_end   THEN x.eff_end  ELSE c.shift_end   END AS seg_end) s
-CROSS APPLY mfg.tvf_break_overlap_sec(c.prod_date, c.shift_code, s.seg_start, s.seg_end) bo
-LEFT JOIN mfg.downtime_reason r ON r.reason_code = e.reason_code
-LEFT JOIN mfg.v_shift_recent sr ON sr.prod_date = c.prod_date AND sr.shift_code = c.shift_code
-WHERE   e.start_ts < n.now_local;
+LEFT JOIN mfg.downtime_reason r ON r.reason_code = seg.reason_code
+LEFT JOIN mfg.v_shift_recent sr ON sr.prod_date = seg.prod_date AND sr.shift_code = seg.shift_code;
+GO
+
+/* แผนเทียบผลิตจริง รายชั่วโมง (เฉพาะกะที่เริ่มแล้ว และเครื่องที่มีงาน)
+   - plan_qty              แผนของชั่วโมงนั้น (กระจายแผนทั้งกะตามนาทีที่ผลิตได้ ชั่วโมงที่มีพักจะได้แผนน้อยลง)
+   - plan_qty_elapsed      แผนที่ "ควรทำได้แล้ว" นับเฉพาะชั่วโมงที่จบแล้ว หรือชั่วโมงปัจจุบันที่มีการส่งยอดเข้ามาแล้ว
+                           (ชั่วโมงปัจจุบันที่ยังไม่มีใครส่งยอด จะยังไม่ถูกนับแผน — ไม่ให้ขึ้นว่าช้ากว่าแผนผิด ๆ)
+   - reported_planned_min  นาทีที่ผลิตได้ในช่วงที่นับแผนแล้ว (ใช้คิด "ทำได้ต่อชั่วโมง")
+   - actual_good_qty       ของดีที่ผลิตได้ (ชั่วโมงที่ยังไม่ถึงจะเป็นค่าว่าง กราฟจะได้หยุดที่ปัจจุบัน)
+   - remaining_planned_min นาทีที่ยังเหลือให้ผลิตในชั่วโมงนั้น (ใช้คิด "ต้องผลิตต่อชั่วโมงถึงจะทัน") */
+CREATE OR ALTER VIEW rpt.v_plan_vs_actual_hour
+AS
+WITH pl AS (
+    SELECT  machine_id, prod_date, shift_code, SUM(plan_qty) AS plan_qty
+    FROM    mfg.production_plan
+    GROUP BY machine_id, prod_date, shift_code
+),
+act AS (
+    SELECT  machine_id, hour_start, SUM(total_qty) AS total_qty, SUM(good_qty) AS good_qty
+    FROM    mfg.production_hour
+    GROUP BY machine_id, hour_start
+)
+SELECT  k.machine_id,
+        h.prod_date,
+        h.shift_code,
+        c.shift_name_th,
+        h.slot_no,
+        h.hour_start,
+        h.hour_end,
+        h.planned_min                                                                       AS slot_planned_min,
+        CAST(ISNULL(pl.plan_qty, 0) * h.planned_min / NULLIF(c.planned_min, 0) AS DECIMAL(12,2)) AS plan_qty,
+        CAST(ISNULL(pl.plan_qty, 0) * rp.reported_planned_min
+             / NULLIF(c.planned_min, 0) AS DECIMAL(12,2))                                   AS plan_qty_elapsed,
+        rp.reported_planned_min,
+        CASE WHEN h.hour_start < n.now_local THEN ISNULL(a.good_qty, 0)  END                AS actual_good_qty,
+        CASE WHEN h.hour_start < n.now_local THEN ISNULL(a.total_qty, 0) END                AS actual_total_qty,
+        r.remaining_planned_min,
+        CASE WHEN h.hour_end  <= n.now_local THEN N'DONE'
+             WHEN h.hour_start <= n.now_local THEN N'CURRENT'
+             ELSE N'FUTURE' END                                                             AS hour_status,
+        CASE WHEN n.now_local >= c.shift_end THEN 1 ELSE 0 END                              AS is_shift_closed,
+        CASE WHEN n.now_local < c.shift_end THEN 1 ELSE 0 END                               AS is_current_shift,
+        sr.shifts_ago
+FROM    mfg.v_machine_shift_scheduled k
+JOIN    mfg.v_shift_calendar c ON c.prod_date = k.prod_date AND c.shift_code = k.shift_code
+JOIN    mfg.v_shift_hour h     ON h.prod_date = k.prod_date AND h.shift_code = k.shift_code
+CROSS JOIN mfg.v_now n
+LEFT JOIN pl    ON pl.machine_id = k.machine_id AND pl.prod_date = k.prod_date AND pl.shift_code = k.shift_code
+LEFT JOIN act a ON a.machine_id = k.machine_id AND a.hour_start = h.hour_start
+LEFT JOIN mfg.v_shift_recent sr ON sr.prod_date = k.prod_date AND sr.shift_code = k.shift_code
+CROSS APPLY (SELECT CASE WHEN n.now_local > h.hour_start THEN n.now_local ELSE h.hour_start END AS rem_from) rf
+CROSS APPLY (SELECT CASE WHEN rf.rem_from > h.hour_end THEN rf.rem_from ELSE h.hour_end END AS rem_to) rt
+CROSS APPLY mfg.tvf_break_overlap_sec(h.prod_date, h.shift_code, rf.rem_from, rt.rem_to) bo
+CROSS APPLY (SELECT CAST((DATEDIFF(SECOND, rf.rem_from, rt.rem_to) - bo.overlap_sec) / 60.0 AS DECIMAL(10,2)) AS remaining_planned_min) r
+CROSS APPLY (SELECT CAST(CASE WHEN h.hour_end <= n.now_local OR a.machine_id IS NOT NULL
+                              THEN h.planned_min - r.remaining_planned_min ELSE 0 END AS DECIMAL(10,2)) AS reported_planned_min) rp
+WHERE   c.shift_start <= n.now_local;
 GO
 
 /* OEE ต่อ เครื่อง x วันผลิต x กะ
    เก็บเป็น "นาที" และ "จำนวนชิ้น" ไว้ให้ Tableau หารเอง (ห้ามเฉลี่ย % ข้ามแถว)
+   - full_shift_planned_min นาทีของกะทั้งกะ หักเวลาพัก
    - shift_planned_min      นาทีตามตารางกะที่ผ่านไปแล้ว หักเวลาพัก (กะปัจจุบันนับถึงตอนนี้)
-   - planned_stop_min       หยุดตามแผน (PM, ไม่มีออร์เดอร์) -> ไม่นับเป็นความสูญเสีย
+   - planned_stop_min       หยุดตามแผน (PM, ไม่มีออร์เดอร์, ประชุม) -> ไม่นับเป็นความสูญเสียของ OEE
+                            แต่ทำให้ผลิตไม่ทันแผนได้ — Dashboard ควรแสดงแยกให้เห็น
    - planned_production_min เวลาที่ตั้งใจจะผลิต = ตัวหารของ Availability และ OEE
-   - unplanned_downtime_min เวลาหยุดที่เป็นความสูญเสีย (รวมเปลี่ยนรุ่น และที่ยังไม่ระบุสาเหตุ)
+   - unplanned_downtime_min เวลาหยุดที่เป็นความสูญเสีย (รวมเปลี่ยนรุ่น หยุดเล็กน้อยที่บันทึกไว้ และที่ยังไม่ระบุสาเหตุ)
    - run_min                เวลาเดินเครื่องจริง
    - ideal_run_min          ชิ้นทั้งหมด x รอบเวลามาตรฐาน
    - good_ideal_min         ชิ้นดี x รอบเวลามาตรฐาน
+   - plan_qty               แผนทั้งกะ ; plan_qty_elapsed = แผนถึงตอนนี้ (กะที่จบแล้ว = แผนทั้งกะ)
    สูตรใน Tableau:
      Availability = SUM(run_min) / SUM(planned_production_min)
      Performance  = SUM(ideal_run_min) / SUM(run_min)
      Quality      = SUM(good_ideal_min) / SUM(ideal_run_min)
-     OEE          = SUM(good_ideal_min) / SUM(planned_production_min)   (= A x P x Q พอดี) */
+     OEE          = SUM(good_ideal_min) / SUM(planned_production_min)   (= A x P x Q พอดี)
+     Attainment % = SUM(good_qty) / SUM(plan_qty_elapsed) */
 CREATE OR ALTER VIEW rpt.v_oee_shift
 AS
 WITH prod AS (
@@ -222,13 +338,18 @@ pl AS (
     LEFT JOIN mfg.std_cycle_time ct ON ct.machine_id = pp.machine_id AND ct.sku = pp.sku
     GROUP BY pp.machine_id, pp.prod_date, pp.shift_code
 ),
+hp AS (
+    SELECT  machine_id, prod_date, shift_code, SUM(plan_qty_elapsed) AS plan_qty_elapsed
+    FROM    rpt.v_plan_vs_actual_hour
+    GROUP BY machine_id, prod_date, shift_code
+),
 dt AS (
     SELECT  machine_id, prod_date, shift_code,
             SUM(CASE WHEN is_planned_stop = 1 THEN downtime_min ELSE 0 END)          AS planned_stop_min,
             SUM(CASE WHEN is_planned_stop = 0 THEN downtime_min ELSE 0 END)          AS unplanned_min,
             SUM(CASE WHEN loss_category = N'UNCODED' THEN downtime_min ELSE 0 END)   AS uncoded_min,
-            COUNT(DISTINCT CASE WHEN is_planned_stop = 0 THEN event_id END)         AS unplanned_stop_count,
-            COUNT(DISTINCT CASE WHEN loss_category = N'BREAKDOWN' THEN event_id END) AS breakdown_count,
+            SUM(CASE WHEN is_planned_stop = 0 THEN stop_count ELSE 0 END)           AS unplanned_stop_count,
+            SUM(CASE WHEN loss_category = N'BREAKDOWN' THEN stop_count ELSE 0 END)   AS breakdown_count,
             SUM(CASE WHEN loss_category = N'BREAKDOWN' THEN downtime_min ELSE 0 END) AS breakdown_min
     FROM    rpt.v_downtime_segment
     GROUP BY machine_id, prod_date, shift_code
@@ -255,6 +376,7 @@ SELECT  k.machine_id,
         CAST(ISNULL(pr.good_ideal_sec, 0) / 60.0 AS DECIMAL(12,2))            AS good_ideal_min,
         ISNULL(pr.qty_missing_ct, 0)                                          AS qty_missing_ct,
         ISNULL(pl.plan_qty, 0)                                                AS plan_qty,
+        CAST(ISNULL(hp.plan_qty_elapsed, 0) AS DECIMAL(12,2))                 AS plan_qty_elapsed,
         CAST(ISNULL(pl.plan_ideal_sec, 0) / 60.0 AS DECIMAL(12,2))            AS plan_ideal_min,
         ISNULL(pl.plan_qty_missing_ct, 0)                                     AS plan_qty_missing_ct,
         CAST(ISNULL(dt.uncoded_min, 0) AS DECIMAL(10,2))                      AS uncoded_downtime_min,
@@ -269,6 +391,7 @@ CROSS APPLY mfg.tvf_break_overlap_sec(c.prod_date, c.shift_code, c.shift_start, 
 CROSS APPLY (SELECT CAST((DATEDIFF(SECOND, c.shift_start, ee.elapsed_end) - bo.overlap_sec) / 60.0 AS DECIMAL(10,2)) AS elapsed_planned_min) e
 LEFT JOIN prod pr ON pr.machine_id = k.machine_id AND pr.prod_date = k.prod_date AND pr.shift_code = k.shift_code
 LEFT JOIN pl      ON pl.machine_id = k.machine_id AND pl.prod_date = k.prod_date AND pl.shift_code = k.shift_code
+LEFT JOIN hp      ON hp.machine_id = k.machine_id AND hp.prod_date = k.prod_date AND hp.shift_code = k.shift_code
 LEFT JOIN dt      ON dt.machine_id = k.machine_id AND dt.prod_date = k.prod_date AND dt.shift_code = k.shift_code
 LEFT JOIN mfg.v_shift_recent sr ON sr.prod_date = k.prod_date AND sr.shift_code = k.shift_code
 CROSS APPLY (SELECT CAST(CASE WHEN ISNULL(dt.planned_stop_min, 0) > e.elapsed_planned_min
@@ -280,60 +403,57 @@ CROSS APPLY (SELECT CAST(CASE WHEN ISNULL(dt.unplanned_min, 0) > a.planned_produ
 WHERE   c.shift_start < n.now_local;
 GO
 
-/* แผนเทียบผลิตจริง รายชั่วโมง (เฉพาะกะที่เริ่มแล้ว และเครื่องที่มีงาน)
-   - plan_qty            แผนของชั่วโมงนั้น (กระจายแผนทั้งกะตามนาทีที่ผลิตได้ ชั่วโมงที่มีพักจะได้แผนน้อยลง)
-   - plan_qty_elapsed    แผนที่ "ควรทำได้ถึงตอนนี้" ในชั่วโมงนั้น
-   - actual_good_qty     ของดีที่ผลิตได้ (ชั่วโมงที่ยังไม่ถึงจะเป็นค่าว่าง กราฟจะได้หยุดที่ปัจจุบัน)
-   - remaining_planned_min  นาทีที่ยังเหลือให้ผลิตในชั่วโมงนั้น (ใช้คำนวณ "ต้องผลิตชั่วโมงละเท่าไรถึงจะทัน") */
-CREATE OR ALTER VIEW rpt.v_plan_vs_actual_hour
+/* แผนของกะปัจจุบันและกะข้างหน้า เทียบ "กำลังผลิตที่ทำได้จริง" ของแต่ละเครื่อง
+   ใช้ตอบคำถาม "แผนที่ออกไป เกินกำลังเครื่องหรือเปล่า" ก่อนจะผลิตไม่ทัน
+   - plan_ideal_min            แผนต้องใช้เวลาเครื่องกี่นาที ถ้าเดินเร็วตามมาตรฐาน ไม่หยุด ไม่เสีย
+   - oee_28d                   OEE จริงของเครื่องนี้ ย้อนหลัง 28 วัน (เฉพาะกะที่จบแล้ว)
+   - capacity_good_ideal_min   กำลังผลิตที่คาดว่าทำได้จริงในกะนั้น = oee_28d x นาทีของกะ (หักพัก)
+   สูตรใน Tableau:  Load vs Capacity % = SUM(plan_ideal_min) / SUM(capacity_good_ideal_min)
+                    เกิน 100% = ถ้าเครื่องทำงานได้เท่าที่ผ่านมา จะผลิตไม่ทันแผน */
+CREATE OR ALTER VIEW rpt.v_plan_capacity
 AS
-WITH pl AS (
-    SELECT  machine_id, prod_date, shift_code, SUM(plan_qty) AS plan_qty
-    FROM    mfg.production_plan
-    GROUP BY machine_id, prod_date, shift_code
+WITH hist AS (
+    SELECT  o.machine_id,
+            SUM(o.good_ideal_min) / NULLIF(SUM(o.planned_production_min), 0) AS oee_28d
+    FROM    rpt.v_oee_shift o
+    CROSS JOIN mfg.v_now n
+    WHERE   o.is_shift_closed = 1
+      AND   o.shift_start >= DATEADD(DAY, -28, n.now_local)
+    GROUP BY o.machine_id
 ),
-act AS (
-    SELECT  machine_id, hour_start, SUM(total_qty) AS total_qty, SUM(good_qty) AS good_qty
-    FROM    mfg.production_hour
-    GROUP BY machine_id, hour_start
+pl AS (
+    SELECT  pp.machine_id, pp.prod_date, pp.shift_code,
+            SUM(pp.plan_qty)                                                    AS plan_qty,
+            SUM(pp.plan_qty * ct.ideal_ct_sec) / 60.0                           AS plan_ideal_min,
+            SUM(CASE WHEN ct.ideal_ct_sec IS NULL THEN pp.plan_qty ELSE 0 END)  AS plan_qty_missing_ct
+    FROM    mfg.production_plan pp
+    LEFT JOIN mfg.std_cycle_time ct ON ct.machine_id = pp.machine_id AND ct.sku = pp.sku
+    GROUP BY pp.machine_id, pp.prod_date, pp.shift_code
 )
-SELECT  k.machine_id,
-        h.prod_date,
-        h.shift_code,
+SELECT  pl.machine_id,
+        pl.prod_date,
+        pl.shift_code,
         c.shift_name_th,
-        h.slot_no,
-        h.hour_start,
-        h.hour_end,
-        h.planned_min                                                                       AS slot_planned_min,
-        CAST(ISNULL(pl.plan_qty, 0) * h.planned_min / NULLIF(c.planned_min, 0) AS DECIMAL(12,2)) AS plan_qty,
-        CAST(ISNULL(pl.plan_qty, 0) * (h.planned_min - r.remaining_planned_min)
-             / NULLIF(c.planned_min, 0) AS DECIMAL(12,2))                                   AS plan_qty_elapsed,
-        CASE WHEN h.hour_start < n.now_local THEN ISNULL(a.good_qty, 0)  END                AS actual_good_qty,
-        CASE WHEN h.hour_start < n.now_local THEN ISNULL(a.total_qty, 0) END                AS actual_total_qty,
-        r.remaining_planned_min,
-        CASE WHEN h.hour_end  <= n.now_local THEN N'DONE'
-             WHEN h.hour_start <= n.now_local THEN N'CURRENT'
-             ELSE N'FUTURE' END                                                             AS hour_status,
-        CASE WHEN n.now_local >= c.shift_end THEN 1 ELSE 0 END                              AS is_shift_closed,
-        CASE WHEN n.now_local < c.shift_end THEN 1 ELSE 0 END                               AS is_current_shift,
-        sr.shifts_ago
-FROM    mfg.v_machine_shift_scheduled k
-JOIN    mfg.v_shift_calendar c ON c.prod_date = k.prod_date AND c.shift_code = k.shift_code
-JOIN    mfg.v_shift_hour h     ON h.prod_date = k.prod_date AND h.shift_code = k.shift_code
+        c.shift_start,
+        CASE WHEN n.now_local >= c.shift_start THEN N'RUNNING' ELSE N'FUTURE' END AS shift_status,
+        pl.plan_qty,
+        CAST(ISNULL(pl.plan_ideal_min, 0) AS DECIMAL(12,2))       AS plan_ideal_min,
+        pl.plan_qty_missing_ct,
+        c.planned_min                                             AS full_shift_planned_min,
+        CAST(h.oee_28d AS DECIMAL(6,4))                           AS oee_28d,
+        CAST(h.oee_28d * c.planned_min AS DECIMAL(12,2))          AS capacity_good_ideal_min
+FROM    pl
+JOIN    mfg.v_shift_calendar c ON c.prod_date = pl.prod_date AND c.shift_code = pl.shift_code
 CROSS JOIN mfg.v_now n
-CROSS APPLY (SELECT CASE WHEN n.now_local > h.hour_start THEN n.now_local ELSE h.hour_start END AS rem_from) rf
-CROSS APPLY (SELECT CASE WHEN rf.rem_from > h.hour_end THEN rf.rem_from ELSE h.hour_end END AS rem_to) rt
-CROSS APPLY mfg.tvf_break_overlap_sec(h.prod_date, h.shift_code, rf.rem_from, rt.rem_to) bo
-CROSS APPLY (SELECT CAST((DATEDIFF(SECOND, rf.rem_from, rt.rem_to) - bo.overlap_sec) / 60.0 AS DECIMAL(10,2)) AS remaining_planned_min) r
-LEFT JOIN pl  ON pl.machine_id = k.machine_id AND pl.prod_date = k.prod_date AND pl.shift_code = k.shift_code
-LEFT JOIN act a ON a.machine_id = k.machine_id AND a.hour_start = h.hour_start
-LEFT JOIN mfg.v_shift_recent sr ON sr.prod_date = k.prod_date AND sr.shift_code = k.shift_code
-WHERE   c.shift_start <= n.now_local;
+LEFT JOIN hist h ON h.machine_id = pl.machine_id
+WHERE   c.shift_end > n.now_local
+  AND   pl.plan_qty > 0;
 GO
 
 /* แผนเทียบผลิตจริง ต่อ เครื่อง x กะ x สินค้า (รวมกะในอนาคตที่มีแผนแล้วด้วย)
    adherence_qty = ของดีที่ผลิตตรงตามแผน (ผลิตเกินแผนของสินค้าหนึ่ง ไม่ชดเชยสินค้าอื่นที่ขาด)
-   Schedule Adherence % ใน Tableau = SUM(adherence_qty) / SUM(plan_qty) */
+   Schedule Adherence % ใน Tableau (นับเฉพาะกะที่จบแล้ว):
+     SUM(IF [Shift Status] = "CLOSED" THEN [Adherence Qty] END) / SUM(IF [Shift Status] = "CLOSED" THEN [Plan Qty] END) */
 CREATE OR ALTER VIEW rpt.v_plan_vs_actual_sku
 AS
 WITH pl AS (
@@ -422,7 +542,8 @@ SELECT  N'1-HIGH' AS severity, N'OPEN_STOP_TOO_LONG' AS check_code,
 FROM    mfg.downtime_event e CROSS JOIN mfg.v_now n
 WHERE   e.end_ts IS NULL AND e.start_ts < DATEADD(HOUR, -12, n.now_local)
 UNION ALL
--- 2) การหยุดซ้อนกันในเครื่องเดียวกัน (ทำให้นับเวลาหยุดเกินจริง) ตรวจย้อนหลัง 60 วัน
+-- 2) การหยุดซ้อนกันในเครื่องเดียวกัน ตรวจย้อนหลัง 60 วัน
+--    (ระบบนับช่วงที่ซ้อนให้รายการที่เริ่มก่อน แต่ควรแก้ข้อมูล: ระบุสาเหตุในรายการเดิม แทนการสร้างรายการใหม่ซ้อน)
 SELECT  N'1-HIGH', N'OVERLAPPING_STOPS', N'บันทึกเครื่องหยุดซ้อนทับกัน',
         a.machine_id, a.start_ts,
         CONCAT(N'event_id=', a.event_id, N' ซ้อนกับ event_id=', b.event_id)
@@ -463,39 +584,60 @@ SELECT  N'2-MEDIUM', N'PERFORMANCE_OVER_100', N'Performance เกิน 105% (�
 FROM    rpt.v_oee_shift o
 WHERE   o.run_min >= 30 AND o.ideal_run_min > o.run_min * 1.05
 UNION ALL
--- 6) ผลิตโดยไม่มีแผน
+-- 6) Performance ต่ำกว่า 60% มักแปลว่ามีเวลาว่าง (ผลิตครบแผนแล้ว/ไม่มีงาน) ที่ไม่ได้บันทึกเป็น NO-ORDER
+SELECT  N'2-MEDIUM', N'PERFORMANCE_UNDER_60', N'Performance ต่ำกว่า 60% (อาจมีเวลาว่าง/หยุดที่ไม่ได้บันทึก)',
+        o.machine_id, o.shift_start,
+        CONCAT(N'กะ ', o.shift_code, N' วันที่ ', CONVERT(NVARCHAR(10), o.prod_date, 120),
+               N' ideal_run_min=', o.ideal_run_min, N' run_min=', o.run_min)
+FROM    rpt.v_oee_shift o
+WHERE   o.is_shift_closed = 1 AND o.run_min >= 60 AND o.ideal_run_min < o.run_min * 0.6
+UNION ALL
+-- 7) ผลิตโดยไม่มีแผน
 SELECT  N'2-MEDIUM', N'PRODUCTION_WITHOUT_PLAN', N'มียอดผลิตแต่ไม่มีแผน',
         o.machine_id, o.shift_start,
         CONCAT(N'กะ ', o.shift_code, N' วันที่ ', CONVERT(NVARCHAR(10), o.prod_date, 120), N' ผลิต ', o.total_qty, N' ชิ้น')
 FROM    rpt.v_oee_shift o
 WHERE   o.plan_qty = 0 AND o.total_qty > 0
 UNION ALL
--- 7) การหยุดที่จบไปเกิน 24 ชม. แล้วแต่ยังไม่ระบุสาเหตุ
+-- 8) การหยุดที่จบไปเกิน 24 ชม. แล้วแต่ยังไม่ระบุสาเหตุ
 SELECT  N'2-MEDIUM', N'UNCODED_STOP', N'เครื่องหยุดแต่ยังไม่ระบุสาเหตุ (เกิน 24 ชม.)',
         e.machine_id, e.start_ts,
         CONCAT(N'event_id=', e.event_id, N' นาน ', DATEDIFF(MINUTE, e.start_ts, e.end_ts), N' นาที')
 FROM    mfg.downtime_event e CROSS JOIN mfg.v_now n
 WHERE   e.reason_code IS NULL AND e.end_ts IS NOT NULL AND e.end_ts < DATEADD(HOUR, -24, n.now_local)
 UNION ALL
--- 8) รหัสสินค้าที่ไม่มีในตารางสินค้า
+-- 9) รหัสสินค้าที่ไม่มีในตารางสินค้า
 SELECT  N'3-LOW', N'UNKNOWN_SKU', N'รหัสสินค้าไม่มีในตาราง mfg.product',
         p.machine_id, MAX(p.hour_start), CONCAT(N'sku=', p.sku)
 FROM    mfg.production_hour p
 WHERE   NOT EXISTS (SELECT 1 FROM mfg.product pr WHERE pr.sku = p.sku)
 GROUP BY p.machine_id, p.sku
 UNION ALL
--- 9) ปฏิทินกะใกล้หมด (เหลือน้อยกว่า 30 วัน)
+-- 10) ปฏิทินกะใกล้หมด (เหลือน้อยกว่า 30 วัน) หรือยังไม่มีเลย
 SELECT  N'1-HIGH', N'CALENDAR_ENDING', N'ปฏิทินกะจะหมดใน 30 วัน ให้รัน mfg.usp_build_shift_calendar',
-        NULL, MAX(c.shift_end), CONCAT(N'ปฏิทินถึง ', CONVERT(NVARCHAR(16), MAX(c.shift_end), 120))
-FROM    mfg.shift_calendar c CROSS JOIN mfg.v_now n
-GROUP BY n.now_local
-HAVING  MAX(c.shift_end) < DATEADD(DAY, 30, n.now_local)
+        NULL, x.max_end, CONCAT(N'ปฏิทินถึง ', ISNULL(CONVERT(NVARCHAR(16), x.max_end, 120), N'(ยังไม่มี)'))
+FROM    (SELECT MAX(c.shift_end) AS max_end FROM mfg.shift_calendar c) x
+CROSS JOIN mfg.v_now n
+WHERE   x.max_end IS NULL OR x.max_end < DATEADD(DAY, 30, n.now_local)
 UNION ALL
--- 10) ยอดผลิตลงเวลาในอนาคต (นาฬิกาเครื่อง/PLC ไม่ตรง)
+-- 11) ปฏิทินกะซ้อนทับกัน (ยอดผลิต 1 ชั่วโมงจะถูกนับ 2 กะ)
+SELECT  N'1-HIGH', N'OVERLAPPING_SHIFTS', N'ปฏิทินกะซ้อนทับกัน (ยอดผลิตถูกนับซ้ำ)',
+        NULL, b.shift_start,
+        CONCAT(CONVERT(NVARCHAR(10), a.prod_date, 120), N' ', a.shift_code, N' ซ้อนกับ ',
+               CONVERT(NVARCHAR(10), b.prod_date, 120), N' ', b.shift_code)
+FROM    mfg.shift_calendar a
+JOIN    mfg.shift_calendar b ON b.shift_start > a.shift_start AND b.shift_start < a.shift_end
+UNION ALL
+-- 12) ข้อมูลเวลาในอนาคต (นาฬิกาเครื่อง/PLC ไม่ตรง หรือบันทึกเวลาจบล่วงหน้า)
 SELECT  N'1-HIGH', N'FUTURE_TIMESTAMP', N'มีข้อมูลเวลาในอนาคต (ตรวจนาฬิกาเครื่อง/PLC)',
-        p.machine_id, p.hour_start, CONCAT(N'sku=', p.sku)
+        p.machine_id, p.hour_start, CONCAT(N'production_hour sku=', p.sku)
 FROM    mfg.production_hour p CROSS JOIN mfg.v_now n
-WHERE   p.hour_start > n.now_local;
+WHERE   p.hour_start > n.now_local
+UNION ALL
+SELECT  N'1-HIGH', N'FUTURE_TIMESTAMP', N'มีข้อมูลเวลาในอนาคต (ตรวจนาฬิกาเครื่อง/PLC)',
+        e.machine_id, e.start_ts, CONCAT(N'downtime event_id=', e.event_id)
+FROM    mfg.downtime_event e CROSS JOIN mfg.v_now n
+WHERE   e.start_ts > n.now_local OR e.end_ts > DATEADD(MINUTE, 5, n.now_local);
 GO
 
 /* =====================================================================
@@ -503,6 +645,8 @@ GO
    ===================================================================== */
 
 /* สร้างปฏิทินกะตามช่วงวันที่ (เพิ่มเฉพาะวันที่ยังไม่มี ไม่ทับของเดิม)
+   - ถ้ากะใหม่จะซ้อนทับกะเดิม ระบบจะยกเลิกทั้งหมดและแจ้งเตือน
+   - วันหยุดใน mfg.holiday จะถูกตั้ง is_working = 0 ให้ด้วย (รวมวันที่สร้างปฏิทินไว้แล้ว ถ้ายังไม่มีแผน)
    ตัวอย่าง:
      EXEC mfg.usp_build_shift_calendar @date_from = '2026-01-01', @date_to = '2027-12-31';
      EXEC mfg.usp_build_shift_calendar '2026-01-01', '2027-12-31', @work_saturday = 0;  -- เสาร์หยุด */
@@ -514,6 +658,7 @@ CREATE OR ALTER PROCEDURE mfg.usp_build_shift_calendar
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
     IF @date_to < @date_from OR DATEDIFF(DAY, @date_from, @date_to) > 3660
     BEGIN
@@ -526,6 +671,10 @@ BEGIN
         RAISERROR(N'ยังไม่มีนิยามกะใน mfg.shift_definition', 16, 1);
         RETURN;
     END;
+
+    DECLARE @added INT, @holiday_updates INT;
+
+    BEGIN TRANSACTION;
 
     WITH n AS (
         SELECT TOP (DATEDIFF(DAY, @date_from, @date_to) + 1)
@@ -557,7 +706,34 @@ BEGIN
       AND   NOT EXISTS (SELECT 1 FROM mfg.shift_calendar c
                         WHERE c.shift_start = st.shift_start);
 
-    PRINT CONCAT(N'เพิ่มปฏิทินกะ ', @@ROWCOUNT, N' แถว');
+    SET @added = @@ROWCOUNT;
+
+    IF EXISTS (SELECT 1
+               FROM   mfg.shift_calendar a
+               JOIN   mfg.shift_calendar b ON b.shift_start > a.shift_start AND b.shift_start < a.shift_end
+               WHERE  a.prod_date BETWEEN DATEADD(DAY, -1, @date_from) AND DATEADD(DAY, 1, @date_to))
+    BEGIN
+        ROLLBACK TRANSACTION;
+        RAISERROR(N'ยกเลิก: กะใหม่ซ้อนทับกะเดิม ถ้าเปลี่ยนรูปแบบกะ ให้ปิดกะเดิม (is_active = 0) และลบปฏิทินอนาคตของกะเดิมก่อน (ดูวิธีใน 03_reference_data.sql)', 16, 1);
+        RETURN;
+    END;
+
+    -- วันหยุดที่เพิ่มภายหลัง: ปิดกะของวันนั้น (เฉพาะที่ยังไม่มีแผน)
+    UPDATE c
+    SET    is_working = 0,
+           note       = ISNULL(c.note, h.holiday_name)
+    FROM   mfg.shift_calendar c
+    JOIN   mfg.holiday h ON h.holiday_date = c.prod_date
+    WHERE  c.prod_date BETWEEN @date_from AND @date_to
+      AND  c.is_working = 1
+      AND  NOT EXISTS (SELECT 1 FROM mfg.production_plan p
+                       WHERE p.prod_date = c.prod_date AND p.shift_code = c.shift_code AND p.plan_qty > 0);
+
+    SET @holiday_updates = @@ROWCOUNT;
+
+    COMMIT TRANSACTION;
+
+    PRINT CONCAT(N'เพิ่มปฏิทินกะ ', @added, N' แถว, ตั้งเป็นวันหยุด ', @holiday_updates, N' แถว');
 END;
 GO
 
@@ -595,6 +771,7 @@ BEGIN
     END;
 
     DECLARE @hour_start DATETIME2(0) = DATEADD(HOUR, DATEDIFF(HOUR, CAST('2000-01-01' AS DATETIME2(0)), @ts), CAST('2000-01-01' AS DATETIME2(0)));
+    DECLARE @now        DATETIME2(0) = (SELECT now_local FROM mfg.v_now);
 
     IF @sku IS NULL
         SELECT TOP (1) @sku = pp.sku
@@ -612,7 +789,7 @@ BEGIN
     SET    total_qty  = CASE WHEN @mode = 'ADD' THEN total_qty + @total_qty ELSE @total_qty END,
            good_qty   = CASE WHEN @mode = 'ADD' THEN good_qty  + @good_qty  ELSE @good_qty  END,
            source     = @source,
-           updated_at = SYSDATETIME()
+           updated_at = @now
     WHERE  machine_id = @machine_id AND hour_start = @hour_start AND sku = @sku;
 
     IF @@ROWCOUNT = 0
@@ -623,9 +800,42 @@ BEGIN
 END;
 GO
 
-/* เริ่มบันทึกเครื่องหยุด — ถ้าเครื่องนั้นมีการหยุดที่ยังเปิดอยู่แล้ว จะไม่สร้างซ้ำ
+/* บันทึกของเสียที่พบภายหลัง (เช่น QC ตรวจตอนจบกะ) — ย้ายจำนวนจากของดีเป็นของเสีย ในชั่วโมงที่ผลิต
+   ตัวอย่าง:  EXEC mfg.usp_add_scrap @machine_id = N'INJ-01', @ts = '2026-10-20 09:00', @sku = N'INJ-A01', @scrap_qty = 5; */
+CREATE OR ALTER PROCEDURE mfg.usp_add_scrap
+    @machine_id NVARCHAR(20),
+    @ts         DATETIME2(0),
+    @sku        NVARCHAR(40),
+    @scrap_qty  INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @scrap_qty IS NULL OR @scrap_qty <= 0
+    BEGIN
+        RAISERROR(N'@scrap_qty ต้องมากกว่า 0', 16, 1);
+        RETURN;
+    END;
+
+    UPDATE mfg.production_hour
+    SET    good_qty   = good_qty - @scrap_qty,
+           updated_at = (SELECT now_local FROM mfg.v_now)
+    WHERE  machine_id = @machine_id
+      AND  sku        = @sku
+      AND  hour_start = DATEADD(HOUR, DATEDIFF(HOUR, CAST('2000-01-01' AS DATETIME2(0)), @ts), CAST('2000-01-01' AS DATETIME2(0)))
+      AND  good_qty  >= @scrap_qty;
+
+    IF @@ROWCOUNT = 0
+        RAISERROR(N'ไม่พบยอดผลิตของเครื่อง/ชั่วโมง/สินค้านี้ หรือจำนวนของเสียมากกว่าของดีที่มีอยู่', 16, 1);
+END;
+GO
+
+/* เริ่มบันทึกเครื่องหยุด — ถ้าเครื่องนั้นมีการหยุดที่ยังเปิดอยู่แล้ว จะไม่สร้างซ้ำ (ส่ง event_id เดิมกลับ)
+   ถ้าระบบอัตโนมัติ (PLC) บันทึกการหยุดไว้แล้ว ให้หน้างานใช้ usp_downtime_set_reason ระบุสาเหตุในรายการนั้น
+   อย่าสร้างรายการใหม่ซ้อน
    ตัวอย่าง:  EXEC mfg.usp_downtime_start @machine_id = N'INJ-01';                    -- หยุดตอนนี้ ยังไม่รู้สาเหตุ
-              EXEC mfg.usp_downtime_start N'INJ-01', '2026-10-20 10:15', N'BD-MECH';  -- ระบุเวลาและสาเหตุ */
+              EXEC mfg.usp_downtime_start N'INJ-01', '2026-10-20 10:15', N'BD-MECH';  -- ระบุเวลาและสาเหตุ
+              EXEC mfg.usp_downtime_start @machine_id = N'INJ-01', @reason_code = N'NO-ORDER';  -- ผลิตครบแผนแล้ว เครื่องว่าง */
 CREATE OR ALTER PROCEDURE mfg.usp_downtime_start
     @machine_id  NVARCHAR(20),
     @start_ts    DATETIME2(0)  = NULL,
@@ -638,7 +848,8 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    IF @start_ts IS NULL SELECT @start_ts = now_local FROM mfg.v_now;
+    DECLARE @now DATETIME2(0) = (SELECT now_local FROM mfg.v_now);
+    IF @start_ts IS NULL SET @start_ts = @now;
 
     BEGIN TRANSACTION;
 
@@ -666,11 +877,12 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    IF @end_ts IS NULL SELECT @end_ts = now_local FROM mfg.v_now;
+    DECLARE @now DATETIME2(0) = (SELECT now_local FROM mfg.v_now);
+    IF @end_ts IS NULL SET @end_ts = @now;
 
     UPDATE mfg.downtime_event
     SET    end_ts     = CASE WHEN @end_ts > start_ts THEN @end_ts ELSE DATEADD(SECOND, 1, start_ts) END,
-           updated_at = SYSDATETIME()
+           updated_at = @now
     WHERE  machine_id = @machine_id AND end_ts IS NULL;
 END;
 GO
@@ -688,7 +900,7 @@ BEGIN
     UPDATE mfg.downtime_event
     SET    reason_code = @reason_code,
            note        = ISNULL(@note, note),
-           updated_at  = SYSDATETIME()
+           updated_at  = (SELECT now_local FROM mfg.v_now)
     WHERE  event_id = @event_id;
 
     IF @@ROWCOUNT = 0
