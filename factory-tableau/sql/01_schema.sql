@@ -131,10 +131,13 @@ CREATE TABLE mfg.shift_break_definition (
 GO
 
 -- ปฏิทินกะ: 1 แถว = 1 กะ ใน 1 วันผลิต (สร้างด้วย mfg.usp_build_shift_calendar)
--- แก้ is_working เองได้ เช่น วันที่ไม่ทำงาน หรือวันที่เพิ่มกะ
+-- แก้ is_working เองได้ เช่น วันที่ไม่ทำงาน หรือวันที่เพิ่มกะ (OT วันหยุด)
+--   ถ้าจะทำงานในวันที่อยู่ใน mfg.holiday ให้ลบวันนั้นออกจาก mfg.holiday ด้วย
+--   ไม่งั้นรัน usp_build_shift_calendar ครั้งถัดไปจะปิดกลับเป็นวันหยุด
+-- กะหนึ่งยาวได้ไม่เกิน 24 ชม. (view ใช้ข้อนี้ช่วยให้ค้นเร็ว)
 IF OBJECT_ID(N'mfg.shift_calendar', N'U') IS NULL
 CREATE TABLE mfg.shift_calendar (
-    prod_date       DATE          NOT NULL,             -- วันผลิต (กะดึกที่ข้ามเที่ยงคืนยังเป็นวันเดียวกับวันที่เริ่มกะ)
+    prod_date       DATE          NOT NULL,             -- วันผลิต (ดู start_day_offset ใน mfg.shift_definition)
     shift_code      NVARCHAR(10)  NOT NULL CONSTRAINT FK_cal_shift REFERENCES mfg.shift_definition (shift_code),
     shift_start     DATETIME2(0)  NOT NULL,
     shift_end       DATETIME2(0)  NOT NULL,
@@ -148,6 +151,9 @@ CREATE TABLE mfg.shift_calendar (
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UX_shift_calendar_start' AND object_id = OBJECT_ID(N'mfg.shift_calendar'))
     CREATE UNIQUE INDEX UX_shift_calendar_start ON mfg.shift_calendar (shift_start) INCLUDE (shift_end, prod_date, shift_code);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'CK_cal_max_24h')
+    ALTER TABLE mfg.shift_calendar WITH CHECK ADD CONSTRAINT CK_cal_max_24h CHECK (shift_end <= DATEADD(DAY, 1, shift_start));
 GO
 
 /* ---------------------------------------------------------------------
@@ -177,13 +183,17 @@ CREATE TABLE mfg.production_hour (
     hour_start      DATETIME2(0)  NOT NULL,
     sku             NVARCHAR(40)  NOT NULL,
     total_qty       INT           NOT NULL CONSTRAINT CK_prod_total CHECK (total_qty >= 0),   -- ผลิตทั้งหมด (ดี+เสีย)
-    good_qty        INT           NOT NULL CONSTRAINT CK_prod_good CHECK (good_qty >= 0),     -- ของดี
+    good_qty        INT           NOT NULL CONSTRAINT CK_prod_good CHECK (good_qty >= 0),     -- ของดี (หักของเสียที่ QC พบภายหลังแล้ว)
+    qc_scrap_qty    INT           NOT NULL CONSTRAINT DF_prod_qc_scrap DEFAULT (0),          -- ของเสียที่ QC พบภายหลัง (usp_add_scrap)
     source          NVARCHAR(20)  NOT NULL CONSTRAINT DF_prod_source DEFAULT (N'MANUAL'),     -- PLC / FORM / IMPORT / MANUAL
     updated_at      DATETIME2(0)  NOT NULL CONSTRAINT DF_prod_updated DEFAULT (CAST(SWITCHOFFSET(SYSDATETIMEOFFSET(), '+07:00') AS DATETIME2(0))),
     CONSTRAINT PK_production_hour PRIMARY KEY (machine_id, hour_start, sku),
     CONSTRAINT CK_prod_good_le_total CHECK (good_qty <= total_qty),
     CONSTRAINT CK_prod_on_hour CHECK (DATEPART(MINUTE, hour_start) = 0 AND DATEPART(SECOND, hour_start) = 0)
 );
+GO
+IF COL_LENGTH(N'mfg.production_hour', N'qc_scrap_qty') IS NULL
+    ALTER TABLE mfg.production_hour ADD qc_scrap_qty INT NOT NULL CONSTRAINT DF_prod_qc_scrap DEFAULT (0);
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_production_hour_time' AND object_id = OBJECT_ID(N'mfg.production_hour'))
     CREATE INDEX IX_production_hour_time ON mfg.production_hour (hour_start) INCLUDE (machine_id, sku, total_qty, good_qty);

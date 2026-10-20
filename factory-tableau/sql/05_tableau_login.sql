@@ -2,7 +2,9 @@
    05_tableau_login.sql  —  สร้างผู้ใช้ "อ่านอย่างเดียว" ให้ Tableau / Tableau Bridge
 
    - ผู้ใช้นี้อ่านได้เฉพาะ view ใน schema rpt (แก้ไข/ลบข้อมูลไม่ได้ และมองไม่เห็นตารางใน mfg)
-   - ต้องเปิด SQL Server ให้ login แบบ SQL Server authentication ได้ (Mixed Mode) — ดูขั้นตอนใน README
+   - ต้องเปิด SQL Server ให้ login แบบ SQL Server authentication ได้ (Mixed Mode)
+     — ดูขั้นตอนใน tableau/01_connect_bridge_publish.md ข้อ ก.1
+   - ถ้าสร้าง login จากเวอร์ชันก่อนไปแล้ว ให้รันครั้งเดียว: ALTER LOGIN tableau_reader WITH DEFAULT_DATABASE = master;
 
    วิธีรัน:
      1) เลือกฐานข้อมูลที่จะให้ Tableau อ่าน (เช่น FactoryBI หรือ FactoryBI_Demo)
@@ -36,7 +38,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = @login)
 BEGIN
     SET @sql = N'CREATE LOGIN ' + QUOTENAME(@login)
              + N' WITH PASSWORD = ' + QUOTENAME(@password, N'''')
-             + N', DEFAULT_DATABASE = ' + QUOTENAME(DB_NAME())
+             + N', DEFAULT_DATABASE = [master]'   -- ไม่ผูกกับฐานข้อมูลใด (ลบ Demo ทิ้งภายหลังได้)
              + N', CHECK_POLICY = ON, CHECK_EXPIRATION = OFF;';
     EXEC sys.sp_executesql @sql;
     PRINT N'สร้าง login tableau_reader แล้ว';

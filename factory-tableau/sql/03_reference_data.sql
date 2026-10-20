@@ -2,9 +2,10 @@
    03_reference_data.sql  —  ข้อมูลตั้งต้น: กะ, เวลาพัก, รหัสสาเหตุหยุด, ปฏิทินกะ
 
    >>> แก้ค่าในไฟล์นี้ให้ตรงกับโรงงานก่อนรัน <<<
-     - ค่าเริ่มต้นคือ 2 กะ x 12 ชม. (08:00-20:00 และ 20:00-08:00) พัก 1 ชม.
-     - ทำงาน จันทร์-เสาร์ หยุดอาทิตย์
-   รันซ้ำได้: เพิ่มเฉพาะรายการที่ยังไม่มี ไม่ทับของเดิม
+     - รูปแบบกะ: แก้ @pattern ในข้อ 1-2 (ค่าเริ่มต้น 2 กะ x 12 ชม. พัก 1 ชม.)
+     - วันทำงาน: แก้ @work_saturday / @work_sunday ในข้อ 5 (ค่าเริ่มต้น จันทร์-เสาร์ หยุดอาทิตย์)
+   รันซ้ำได้: เพิ่มเฉพาะรายการที่ยังไม่มี ไม่ทับของเดิม และสร้างปฏิทินต่อจากวันสุดท้ายที่มีอยู่
+   ถ้าจะ "เปลี่ยนรูปแบบกะ" หลังจากใช้งานไปแล้ว ห้ามรันทั้งไฟล์ ให้ทำตามกรอบท้ายไฟล์
    ===================================================================== */
 
 SET ANSI_NULLS ON;
@@ -19,51 +20,46 @@ END
 GO
 
 /* ---------------------------------------------------------------------
-   1) กะทำงาน
+   1-2) กะทำงาน และเวลาพัก — เลือกรูปแบบกะที่บรรทัด @pattern บรรทัดเดียว
+     '2x12'     = กะเช้า 08:00-20:00 / กะดึก 20:00-08:00 พัก 1 ชม. (ค่าเริ่มต้น)
+     '3x8'      = กะ A 07:00 / B 15:00 / C 23:00 พัก 30 นาที (กะ C นับเป็นวันผลิตของวันที่เริ่มกะ)
+     '3x8_next' = เหมือน 3x8 แต่นับกะ C 23:00 เป็น "กะแรกของวันผลิตถัดไป"
+   ถ้าเวลาไม่ตรงกับโรงงาน ให้แก้ตัวเลขในแถวของรูปแบบที่เลือก
+     - เวลาเริ่มกะต้องตรงชั่วโมง และความยาวกะ (นาที) ต้องเป็นชั่วโมงเต็ม
+     - เวลาพัก: offset_min = เริ่มพักหลังเริ่มกะกี่นาที เช่น กะเช้า 08:00 + 240 = พัก 12:00
+       ถ้ามีพักย่อย ให้เพิ่มแถว break_no = 2 ; ถ้าเครื่องเดินต่อตอนพัก (มีคนเปลี่ยนแทน) ให้ลบแถวพักของกะนั้น
    --------------------------------------------------------------------- */
+DECLARE @pattern VARCHAR(10) = '2x12';   -- <<< แก้ตรงนี้: '2x12' | '3x8' | '3x8_next'
+
 INSERT INTO mfg.shift_definition (shift_code, shift_name_th, start_time, duration_min, start_day_offset, sort_order)
 SELECT v.shift_code, v.shift_name_th, v.start_time, v.duration_min, v.start_day_offset, v.sort_order
 FROM (VALUES
-    (N'D', N'กะเช้า', CAST('08:00' AS TIME(0)), 720, 0, 1),
-    (N'N', N'กะดึก', CAST('20:00' AS TIME(0)), 720, 0, 2)
-    /* ถ้าเป็น 3 กะ x 8 ชม. ให้ใช้ชุดนี้แทน 2 บรรทัดบน (และแก้เวลาพักในข้อ 2 ให้ใช้ A/B/C)
-    (N'A', N'กะ A', CAST('07:00' AS TIME(0)), 480, 0, 1),
-    (N'B', N'กะ B', CAST('15:00' AS TIME(0)), 480, 0, 2),
-    (N'C', N'กะ C', CAST('23:00' AS TIME(0)), 480, 0, 3)
-       ถ้าโรงงานนับกะ 23:00 เป็น "กะแรกของวันถัดไป" ให้ใช้ลำดับนี้แทน (ตัวเลข -1 = เริ่มก่อนวันผลิต 1 วัน)
-    (N'C', N'กะ C', CAST('23:00' AS TIME(0)), 480, -1, 1),
-    (N'A', N'กะ A', CAST('07:00' AS TIME(0)), 480, 0, 2),
-    (N'B', N'กะ B', CAST('15:00' AS TIME(0)), 480, 0, 3)
-    */
-) v (shift_code, shift_name_th, start_time, duration_min, start_day_offset, sort_order)
-WHERE NOT EXISTS (SELECT 1 FROM mfg.shift_definition s WHERE s.shift_code = v.shift_code);
-GO
+    ('2x12',     N'D', N'กะเช้า', CAST('08:00' AS TIME(0)), 720,  0, 1),
+    ('2x12',     N'N', N'กะดึก', CAST('20:00' AS TIME(0)), 720,  0, 2),
+    ('3x8',      N'A', N'กะ A',  CAST('07:00' AS TIME(0)), 480,  0, 1),
+    ('3x8',      N'B', N'กะ B',  CAST('15:00' AS TIME(0)), 480,  0, 2),
+    ('3x8',      N'C', N'กะ C',  CAST('23:00' AS TIME(0)), 480,  0, 3),
+    ('3x8_next', N'C', N'กะ C',  CAST('23:00' AS TIME(0)), 480, -1, 1),
+    ('3x8_next', N'A', N'กะ A',  CAST('07:00' AS TIME(0)), 480,  0, 2),
+    ('3x8_next', N'B', N'กะ B',  CAST('15:00' AS TIME(0)), 480,  0, 3)
+) v (pattern, shift_code, shift_name_th, start_time, duration_min, start_day_offset, sort_order)
+WHERE v.pattern = @pattern
+  AND NOT EXISTS (SELECT 1 FROM mfg.shift_definition s WHERE s.shift_code = v.shift_code);
 
-/* ---------------------------------------------------------------------
-   ถ้าเคยรันไฟล์นี้ไปแล้ว และต้องการ "เปลี่ยนรูปแบบกะ" (เช่น จาก 2 กะเป็น 3 กะ)
-   ห้ามรันซ้ำเฉย ๆ เพราะกะใหม่จะซ้อนกะเดิม (ระบบจะยกเลิกและแจ้งเตือน) ให้ทำตามนี้ก่อน:
-     DECLARE @change_date DATE = '2026-11-01';            -- วันแรกที่ใช้กะแบบใหม่
-     UPDATE mfg.shift_definition SET is_active = 0 WHERE shift_code IN (N'D', N'N');
-     DELETE c FROM mfg.shift_calendar c
-     WHERE  c.shift_code IN (N'D', N'N') AND c.prod_date >= @change_date
-       AND  NOT EXISTS (SELECT 1 FROM mfg.production_plan p WHERE p.prod_date = c.prod_date AND p.shift_code = c.shift_code);
-   แล้วเพิ่มกะใหม่ + เวลาพักใหม่ และรัน mfg.usp_build_shift_calendar @date_from = @change_date, ...
-   --------------------------------------------------------------------- */
-
-/* ---------------------------------------------------------------------
-   2) เวลาพัก: offset_min = เริ่มพักหลังเริ่มกะกี่นาที
-      กะเช้า 08:00 + 240 นาที = พัก 12:00-13:00
-      กะดึก 20:00 + 240 นาที = พัก 00:00-01:00
-      ถ้ามีพักย่อย เช่น 10:00-10:10 ให้เพิ่มแถว break_no = 2, offset_min = 120, break_min = 10
-      ถ้าเครื่องเดินต่อตอนพัก (มีคนเปลี่ยนแทน) ไม่ต้องใส่เวลาพัก
-   --------------------------------------------------------------------- */
 INSERT INTO mfg.shift_break_definition (shift_code, break_no, offset_min, break_min)
 SELECT v.shift_code, v.break_no, v.offset_min, v.break_min
 FROM (VALUES
-    (N'D', 1, 240, 60),
-    (N'N', 1, 240, 60)
-) v (shift_code, break_no, offset_min, break_min)
-WHERE EXISTS (SELECT 1 FROM mfg.shift_definition s WHERE s.shift_code = v.shift_code)
+    ('2x12',     N'D', 1, 240, 60),
+    ('2x12',     N'N', 1, 240, 60),
+    ('3x8',      N'A', 1, 240, 30),
+    ('3x8',      N'B', 1, 240, 30),
+    ('3x8',      N'C', 1, 240, 30),
+    ('3x8_next', N'A', 1, 240, 30),
+    ('3x8_next', N'B', 1, 240, 30),
+    ('3x8_next', N'C', 1, 240, 30)
+) v (pattern, shift_code, break_no, offset_min, break_min)
+WHERE v.pattern = @pattern
+  AND EXISTS (SELECT 1 FROM mfg.shift_definition s WHERE s.shift_code = v.shift_code)
   AND NOT EXISTS (SELECT 1 FROM mfg.shift_break_definition b WHERE b.shift_code = v.shift_code AND b.break_no = v.break_no);
 GO
 
@@ -96,6 +92,7 @@ GO
 /* ---------------------------------------------------------------------
    4) วันหยุดโรงงาน (ตัวอย่าง — ใส่ตามปฏิทินของโรงงาน)
       ใส่ภายหลังก็ได้ แล้วรัน mfg.usp_build_shift_calendar ช่วงวันที่นั้นซ้ำ ระบบจะปิดกะวันหยุดให้
+      ถ้าตัดสินใจทำงานในวันที่อยู่ในตารางนี้ ให้ลบวันนั้นออกจาก mfg.holiday ก่อน แล้วแก้ is_working = 1 ใน mfg.shift_calendar
    --------------------------------------------------------------------- */
 /*
 INSERT INTO mfg.holiday (holiday_date, holiday_name) VALUES
@@ -106,20 +103,62 @@ INSERT INTO mfg.holiday (holiday_date, holiday_name) VALUES
 */
 
 /* ---------------------------------------------------------------------
-   5) สร้างปฏิทินกะ: ตั้งแต่ต้นเดือนเมื่อ 3 เดือนก่อน ถึงสิ้นปีหน้า
-      ถ้าจะนำเข้าข้อมูลย้อนหลังเก่ากว่านั้น ให้รันเพิ่มเอง เช่น
-      EXEC mfg.usp_build_shift_calendar '2025-01-01', '2025-12-31';
+   5) สร้างปฏิทินกะ ถึงสิ้นปีหน้า
+      ครั้งแรก: เริ่มตั้งแต่ต้นเดือนเมื่อ 3 เดือนก่อน / ครั้งต่อไป: ต่อจากวันสุดท้ายที่มีอยู่
+      ถ้าจะนำเข้าข้อมูลย้อนหลังเก่ากว่านั้น ให้รันเพิ่มเอง (ใช้ค่าเสาร์/อาทิตย์เดียวกับด้านล่าง) เช่น
+      EXEC mfg.usp_build_shift_calendar '2025-01-01', '2025-12-31', @work_saturday = 1, @work_sunday = 0;
    --------------------------------------------------------------------- */
 DECLARE @today DATE = (SELECT CAST(now_local AS DATE) FROM mfg.v_now);
-DECLARE @from  DATE = DATEADD(MONTH, -3, DATEFROMPARTS(YEAR(@today), MONTH(@today), 1));
 DECLARE @to    DATE = DATEFROMPARTS(YEAR(@today) + 1, 12, 31);
+DECLARE @from  DATE = ISNULL((SELECT DATEADD(DAY, 1, MAX(prod_date)) FROM mfg.shift_calendar),
+                             DATEADD(MONTH, -3, DATEFROMPARTS(YEAR(@today), MONTH(@today), 1)));
 
-EXEC mfg.usp_build_shift_calendar
-     @date_from     = @from,
-     @date_to       = @to,
-     @work_saturday = 1,   -- 1 = เสาร์ทำงาน
-     @work_sunday   = 0;   -- 0 = อาทิตย์หยุด
+IF @from <= @to
+    EXEC mfg.usp_build_shift_calendar
+         @date_from     = @from,
+         @date_to       = @to,
+         @work_saturday = 1,   -- 1 = เสาร์ทำงาน, 0 = เสาร์หยุด
+         @work_sunday   = 0;   -- 1 = อาทิตย์ทำงาน, 0 = อาทิตย์หยุด
+ELSE
+    PRINT N'ปฏิทินกะมีถึงสิ้นปีหน้าแล้ว';
 GO
+
+/* =====================================================================
+   เปลี่ยนรูปแบบกะ (เช่น 2 กะ → 3 กะ) หลังจากใช้งานไปแล้ว — ห้ามรันไฟล์นี้ซ้ำทั้งไฟล์ ให้ทำ 2 ขั้น
+   (กะแบบใหม่ต้องใช้รหัสกะต่างจากเดิม เช่น เดิม D/N ใหม่ A/B/C)
+
+   ขั้น 1: แก้ @pattern ในข้อ 1-2 เป็นรูปแบบใหม่ → ลากคลุมเฉพาะข้อ 1-2 (ตั้งแต่ DECLARE @pattern ถึง GO) → Execute
+   ขั้น 2: แก้ @change_date และรหัสกะเดิมด้านล่าง → ลากคลุมเฉพาะคำสั่ง (ไม่รวมบรรทัดคำอธิบายนี้) → Execute
+
+DECLARE @change_date DATE = '2026-11-01';                    -- วันผลิตแรกที่ใช้กะแบบใหม่
+DECLARE @old TABLE (shift_code NVARCHAR(10));
+INSERT INTO @old VALUES (N'D'), (N'N');                      -- รหัสกะเดิม
+-- ต้องไม่มีแผนของกะเดิมตั้งแต่วันเปลี่ยน
+IF EXISTS (SELECT 1 FROM mfg.production_plan p JOIN @old o ON o.shift_code = p.shift_code WHERE p.prod_date >= @change_date)
+BEGIN
+    SELECT p.* FROM mfg.production_plan p JOIN @old o ON o.shift_code = p.shift_code WHERE p.prod_date >= @change_date;
+    RAISERROR(N'ยังมีแผนของกะเดิมหลังวันเปลี่ยน (ดูตารางผลลัพธ์) ให้ลบ หรือนำเข้าแผนใหม่ตามกะใหม่ก่อน', 16, 1);
+    RETURN;
+END;
+UPDATE s SET is_active = 0 FROM mfg.shift_definition s JOIN @old o ON o.shift_code = s.shift_code;
+DECLARE @first_new_start DATETIME2(0) =
+    (SELECT MIN(DATEADD(HOUR, DATEPART(HOUR, start_time), DATEADD(DAY, start_day_offset, CAST(@change_date AS DATETIME2(0)))))
+     FROM mfg.shift_definition WHERE is_active = 1);
+IF @first_new_start IS NULL
+BEGIN
+    RAISERROR(N'ยังไม่มีกะแบบใหม่ — ทำขั้น 1 ก่อน', 16, 1);
+    RETURN;
+END;
+-- ลบปฏิทินกะเดิมตั้งแต่กะแรกของรูปแบบใหม่ และตัดกะเดิมที่คร่อมเวลาเริ่มกะใหม่ให้จบพอดี
+DELETE c FROM mfg.shift_calendar c JOIN @old o ON o.shift_code = c.shift_code WHERE c.shift_start >= @first_new_start;
+UPDATE c SET shift_end = @first_new_start, note = N'ตัดจบเพราะเปลี่ยนรูปแบบกะ'
+FROM   mfg.shift_calendar c JOIN @old o ON o.shift_code = c.shift_code
+WHERE  c.shift_start < @first_new_start AND c.shift_end > @first_new_start;
+DECLARE @to DATE = DATEFROMPARTS(YEAR(@change_date) + 1, 12, 31);
+EXEC mfg.usp_build_shift_calendar @date_from = @change_date, @date_to = @to, @work_saturday = 1, @work_sunday = 0;
+
+   หลังเปลี่ยนแล้ว ห้ามสร้างปฏิทินช่วงวันที่ก่อน @change_date อีก
+   ===================================================================== */
 
 PRINT N'03_reference_data.sql เสร็จ';
 GO

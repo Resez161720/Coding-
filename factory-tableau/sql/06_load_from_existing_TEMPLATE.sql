@@ -3,6 +3,12 @@
 
    ใช้เมื่อโรงงานมีตารางเก็บยอดผลิต/เครื่องหยุดอยู่แล้ว (จาก PLC, MES, โปรแกรมเดิม)
    แทนที่จะให้ระบบเดิมเขียนเข้า mfg โดยตรง ให้ตั้งเวลา (ทุก 15-60 นาที) รัน procedure นี้
+   (ถ้ายังไม่มีระบบเดิม ให้กรอก Excel แล้วนำเข้าด้วย 07_excel_import.sql แทน)
+
+   ขั้นตอน:
+     1) รันไฟล์นี้ทั้งไฟล์ได้เลยครั้งแรก (ส่วนเพิ่มคอลัมน์ source_ref จะทำงาน ส่วนแม่แบบยังเป็นคอมเมนต์)
+     2) แก้ชื่อในเครื่องหมาย <<...>> ในแม่แบบให้ครบ ลบบรรทัด BEGIN-TEMPLATE / END-TEMPLATE แล้วรันอีกครั้ง
+     3) ทดสอบ: EXEC mfg.usp_load_from_existing;  แล้วตั้งเวลาให้รันอัตโนมัติ
 
    >>> ไฟล์นี้เป็นแม่แบบ ต้องแก้ชื่อตาราง/คอลัมน์ในเครื่องหมาย <<...>> ให้ตรงกับของจริงก่อน <<<
    ถ้าไม่แน่ใจ ส่งผลของคำสั่งนี้มาให้ช่วยแก้ได้ (ส่งแค่โครงสร้าง ไม่ต้องส่งข้อมูล):
@@ -12,8 +18,14 @@
    การตั้งเวลา:
      - SQL Server รุ่น Standard/Enterprise: ใช้ SQL Server Agent สร้าง Job รัน
          EXEC mfg.usp_load_from_existing;
-     - SQL Server Express (ไม่มี Agent): ใช้ Windows Task Scheduler รันคำสั่ง
-         sqlcmd -S <ชื่อเซิร์ฟเวอร์> -d FactoryBI -E -Q "EXEC mfg.usp_load_from_existing"
+     - SQL Server Express (ไม่มี Agent): Windows Task Scheduler → Create Task → Triggers: ทุก 15 นาที
+       → Actions: Program = sqlcmd , Arguments =
+         -S .\SQLEXPRESS -d FactoryBI -E -C -b -Q "EXEC mfg.usp_load_from_existing" -o C:\FactoryBI\load_log.txt
+       -S  ใส่ชื่อเดียวกับที่ใช้ต่อ SSMS
+       -E  ใช้บัญชี Windows ที่ตั้งใน Task ซึ่งต้องมีสิทธิ์ในฐานข้อมูล FactoryBI
+       -b  ถ้า error ให้ Task แสดงว่าล้มเหลว (ไม่ใส่จะขึ้นว่าสำเร็จเสมอ แม้ดึงข้อมูลไม่ได้)
+       -C  ใช้เมื่อ sqlcmd รุ่นใหม่ขึ้น error เรื่องใบรับรอง (certificate)
+       ตรวจทุกวันที่ Task Scheduler → History (Last Run Result ต้องเป็น 0x0) และไฟล์ load_log.txt
    ===================================================================== */
 
 SET ANSI_NULLS ON;
@@ -25,6 +37,14 @@ BEGIN
     RAISERROR(N'กรุณาเลือกฐานข้อมูลของโรงงาน (เช่น FactoryBI) ก่อนรันสคริปต์นี้', 16, 1);
     SET NOEXEC ON;
 END
+GO
+
+-- ทำครั้งแรกครั้งเดียว (รันได้เลย ไม่ต้องแก้): คอลัมน์เก็บรหัสการหยุดจากระบบเดิม เพื่อไม่ให้ข้อมูลซ้ำเวลาดึงซ้ำ
+IF COL_LENGTH(N'mfg.downtime_event', N'source_ref') IS NULL
+    ALTER TABLE mfg.downtime_event ADD source_ref NVARCHAR(100) NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UX_downtime_source_ref' AND object_id = OBJECT_ID(N'mfg.downtime_event'))
+    CREATE UNIQUE INDEX UX_downtime_source_ref ON mfg.downtime_event (source_ref) WHERE source_ref IS NOT NULL;
 GO
 
 /* BEGIN-TEMPLATE  <<< แก้ชื่อในเครื่องหมาย <<...>> ให้ครบ แล้วลบบรรทัดนี้ทั้งบรรทัด
@@ -55,19 +75,23 @@ BEGIN
                 SUM(src.<<good_qty_col>>)                                   AS good_qty      -- ถ้ามีแต่ของเสีย: SUM(total - ng)
         FROM    <<schema>>.<<production_table>> src
         WHERE   src.<<timestamp_col>> >= @since
+          AND   EXISTS (SELECT 1 FROM mfg.machine m WHERE m.machine_id = src.<<machine_col>>)   -- ข้ามเครื่องที่ยังไม่มีใน mfg.machine
         GROUP BY src.<<machine_col>>, DATEADD(HOUR, DATEDIFF(HOUR, 0, src.<<timestamp_col>>), 0), ISNULL(src.<<sku_col>>, N'UNKNOWN')
+        HAVING  SUM(src.<<good_qty_col>>) >= 0 AND SUM(src.<<total_qty_col>>) >= SUM(src.<<good_qty_col>>)   -- ข้ามยอดที่ผิด
     ) AS s
     ON  t.machine_id = s.machine_id AND t.hour_start = s.hour_start AND t.sku = s.sku
-    WHEN MATCHED AND (t.total_qty <> s.total_qty OR t.good_qty <> s.good_qty) THEN
-        UPDATE SET total_qty = s.total_qty, good_qty = s.good_qty, source = N'IMPORT', updated_at = @now
+    -- good_qty หักของเสียที่ QC บันทึกภายหลัง (qc_scrap_qty) ไว้เสมอ ไม่ให้การดึงซ้ำล้างของเสียทิ้ง
+    WHEN MATCHED AND (t.total_qty <> s.total_qty
+                      OR t.good_qty <> CASE WHEN s.good_qty > t.qc_scrap_qty THEN s.good_qty - t.qc_scrap_qty ELSE 0 END) THEN
+        UPDATE SET total_qty  = s.total_qty,
+                   good_qty   = CASE WHEN s.good_qty > t.qc_scrap_qty THEN s.good_qty - t.qc_scrap_qty ELSE 0 END,
+                   source     = N'IMPORT',
+                   updated_at = @now
     WHEN NOT MATCHED BY TARGET THEN
         INSERT (machine_id, hour_start, sku, total_qty, good_qty, source)
         VALUES (s.machine_id, s.hour_start, s.sku, s.total_qty, s.good_qty, N'IMPORT');
 
-    -- 2) เครื่องหยุด: ต้องมีรหัสอ้างอิงจากระบบเดิม เพื่อไม่ให้ซ้ำเวลาดึงซ้ำ
-    --    เพิ่มคอลัมน์ source_ref ครั้งแรกครั้งเดียว:
-    --      ALTER TABLE mfg.downtime_event ADD source_ref NVARCHAR(100) NULL;
-    --      CREATE UNIQUE INDEX UX_downtime_source_ref ON mfg.downtime_event (source_ref) WHERE source_ref IS NOT NULL;
+    -- 2) เครื่องหยุด: ใช้รหัสอ้างอิงจากระบบเดิม (source_ref) เพื่อไม่ให้ซ้ำเวลาดึงซ้ำ
     MERGE mfg.downtime_event AS t
     USING (
         SELECT  CAST(src.<<stop_id_col>> AS NVARCHAR(100)) AS source_ref,
@@ -80,12 +104,14 @@ BEGIN
                     (N'<<รหัสเดิม 1>>', N'BD-MECH'),
                     (N'<<รหัสเดิม 2>>', N'SETUP')
                   ) map (old_code, reason_code) ON map.old_code = src.<<stop_reason_col>>
-        WHERE   src.<<stop_start_col>> >= @since
-           OR   src.<<stop_end_col>> IS NULL
-           OR   src.<<stop_end_col>> >= @since
-           -- การหยุดที่ยังเปิดค้างใน mfg (เริ่มก่อนช่วงที่ดึง) ต้องดึงมาปิดด้วย
-           OR   EXISTS (SELECT 1 FROM mfg.downtime_event o
-                        WHERE o.source_ref = CAST(src.<<stop_id_col>> AS NVARCHAR(100)) AND o.end_ts IS NULL)
+        WHERE   EXISTS (SELECT 1 FROM mfg.machine m WHERE m.machine_id = src.<<machine_col>>)   -- ข้ามเครื่องที่ยังไม่มี
+          AND   (src.<<stop_end_col>> IS NULL OR src.<<stop_end_col>> > src.<<stop_start_col>>)    -- ข้ามเวลาที่ผิด
+          AND  (    src.<<stop_start_col>> >= @since
+                OR  src.<<stop_end_col>> IS NULL
+                OR  src.<<stop_end_col>> >= @since
+                -- การหยุดที่ยังเปิดค้างใน mfg (เริ่มก่อนช่วงที่ดึง) ต้องดึงมาปิดด้วย
+                OR  EXISTS (SELECT 1 FROM mfg.downtime_event o
+                            WHERE o.source_ref = CAST(src.<<stop_id_col>> AS NVARCHAR(100)) AND o.end_ts IS NULL))
     ) AS s
     ON  t.source_ref = s.source_ref
     WHEN MATCHED THEN
@@ -100,29 +126,7 @@ END;
 END-TEMPLATE  <<< ลบบรรทัดนี้ทั้งบรรทัดด้วย */
 GO
 
-/* ---------------------------------------------------------------------
-   นำเข้าแผนการผลิตจาก Excel (ทำทุกครั้งที่ฝ่ายวางแผนออกแผนใหม่)
-   1) ใน Excel ทำคอลัมน์: prod_date | shift_code | machine_id | sku | plan_qty
-   2) SSMS: คลิกขวาที่ฐานข้อมูล > Tasks > Import Flat File (บันทึก Excel เป็น CSV UTF-8 ก่อน)
-      ตั้งชื่อตารางปลายทางว่า stg_plan (schema dbo)
-   3) รันคำสั่งด้านล่าง แล้วลบ stg_plan ทิ้ง
-   --------------------------------------------------------------------- */
-/*
-MERGE mfg.production_plan AS t
-USING (
-    SELECT CAST(prod_date AS DATE) AS prod_date, shift_code, machine_id, sku, SUM(CAST(plan_qty AS INT)) AS plan_qty
-    FROM   dbo.stg_plan
-    GROUP BY CAST(prod_date AS DATE), shift_code, machine_id, sku
-) AS s
-ON  t.prod_date = s.prod_date AND t.shift_code = s.shift_code AND t.machine_id = s.machine_id AND t.sku = s.sku
-WHEN MATCHED THEN
-    UPDATE SET plan_qty = s.plan_qty, source = N'EXCEL', updated_at = (SELECT now_local FROM mfg.v_now)
-WHEN NOT MATCHED BY TARGET THEN
-    INSERT (prod_date, shift_code, machine_id, sku, plan_qty, source)
-    VALUES (s.prod_date, s.shift_code, s.machine_id, s.sku, s.plan_qty, N'EXCEL');
-
-DROP TABLE dbo.stg_plan;
-*/
+-- นำเข้าแผนการผลิต / ยอดผลิต / เครื่องหยุด / ข้อมูลหลัก จาก Excel: ดู 07_excel_import.sql
 
 SET NOEXEC OFF;
 GO

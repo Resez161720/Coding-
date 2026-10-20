@@ -17,7 +17,9 @@
 แล้วเปิด Tableau Desktop → *Connect → Microsoft SQL Server*
 - Server: ใส่ **ชื่อเครื่อง** อย่างเดียว (หรือ `ชื่อเครื่อง, 1433`) — **ไม่ต้องใส่ `\SQLEXPRESS`** เพราะข้อ 2 ตั้งพอร์ต 1433 ไว้แล้ว
   (ถ้าใส่ `\SQLEXPRESS` ต้องเปิด Firewall **UDP 1434** ให้ SQL Server Browser เพิ่ม)
-- Database: `FactoryBI`; เลือก *Use a specific username and password* → `tableau_reader`
+- Database: ช่วงทดลองกับข้อมูลตัวอย่างใส่ `FactoryBI_Demo` / ใช้งานจริงใส่ `FactoryBI`
+  (ต้องรัน `05_tableau_login.sql` ในฐานข้อมูลนั้นแล้ว ไม่งั้นจะขึ้น "Cannot open database ... Login failed")
+- เลือก *Use a specific username and password* → `tableau_reader`
 - **จดชื่อ Server ที่พิมพ์ไว้** ต้องใช้ชื่อเดียวกันนี้ทุก data source และใน Private Network Allowlist (ข้อ ข.4)
 
 ## ข. ติดตั้ง Tableau Bridge (ติดตั้งครั้งเดียว แต่ต้อง sign in ใหม่เป็นระยะ)
@@ -41,9 +43,9 @@ Tableau Cloud อยู่บนอินเทอร์เน็ต มอง�
 5. ตั้งเวลาของ site: Tableau Cloud → *Settings* → **Site Time Zone for Extracts** → เลือก **(GMT+07:00) Bangkok**
    ถ้าไม่ตั้ง ฟังก์ชัน TODAY()/NOW() และตัวกรอง "วันนี้/เมื่อวาน" ใน extract จะใช้เวลา UTC (ช้ากว่าไทย 7 ชม.)
 6. ตั้งเวลาของ **ทุกคนที่จะตั้งตารางเวลา** (refresh / subscription): รูปผู้ใช้มุมขวาบน → *My Account Settings* → **Time zone for scheduled tasks** → (GMT+07:00) Bangkok → Save
-   (ข้อ 5 มีผลแค่สูตรวันที่ใน extract ไม่ได้กำหนดว่า subscription 08:30 จะส่งตอนกี่โมง)
+   (ข้อ 5 มีผลแค่สูตรวันที่ใน extract ไม่ได้กำหนดว่า subscription 08:45 จะส่งตอนกี่โมง)
 
-ข้อจำกัดที่ควรรู้ของ Bridge: query แบบ Live หมดเวลาที่ 15 นาที และต่อได้พร้อมกัน 16 query ต่อเครื่อง Bridge — view ในชุดนี้เบามาก ไม่เป็นปัญหา
+ข้อจำกัดที่ควรรู้ของ Bridge: query แบบ Live หมดเวลาที่ 15 นาที และต่อได้พร้อมกัน 16 query ต่อเครื่อง Bridge — view ในชุดนี้ใช้เวลาไม่กี่วินาทีต่อข้อมูล 1 ปี ไม่เป็นปัญหา
 
 ## ค. สร้าง Data Source 4 ตัว แล้ว Publish
 
@@ -63,7 +65,7 @@ Tableau Cloud อยู่บนอินเทอร์เน็ต มอง�
 (สร้าง data source เสร็จ จะเปลี่ยนกลับเป็นภาษาไทยก็ได้ ชื่อที่แปลงแล้วติดไปกับ data source)
 
 ขั้นตอนต่อ 1 data source:
-1. *Connect → Microsoft SQL Server* → ใส่ Server (ชื่อเดียวกับใน allowlist) / `FactoryBI` / `tableau_reader`
+1. *Connect → Microsoft SQL Server* → ใส่ Server (ชื่อเดียวกับใน allowlist) / Database (`FactoryBI_Demo` ตอนทดลอง, `FactoryBI` ตอนใช้จริง) / `tableau_reader`
 2. ลากตารางหลัก (เช่น `v_oee_shift`) ลงพื้นที่ว่าง **ก่อน** แล้วลาก `v_machine` ตามมา → Tableau จะสร้าง **Relationship** (เส้นยืดหยุ่น) ให้ ตั้งเงื่อนไขเป็น `machine_id = machine_id`
    *ใช้ Relationship ไม่ใช่ Join* — จะได้ไม่มียอดเบิ้ล
 3. มุมขวาบนเลือก **Extract** (หรือ Live สำหรับ data source ที่ใช้กับจอทีวี)
@@ -71,11 +73,16 @@ Tableau Cloud อยู่บนอินเทอร์เน็ต มอง�
 5. ตั้งชื่อ data source ตามตารางด้านบน
 6. *Server → Publish Data Source → Tableau Cloud*
    - Authentication: **Embedded password**
-   - ถ้าเป็น Extract: ตั้ง **Refresh schedule ทุก 1 ชั่วโมง** (Tableau Cloud refresh ได้ถี่สุดชั่วโมงละครั้ง) — ข้อมูลชุดนี้เล็ก ใช้ Full refresh ได้เลย
+   - ถ้าเป็น Extract: ตั้ง **Refresh schedule ทุก 1 ชั่วโมง ให้เริ่มที่นาที :05** (เช่น 00:05, 01:05 …) — Tableau Cloud refresh ได้ถี่สุดชั่วโมงละครั้ง และใช้ Full refresh ได้เลย
+   - `FAC - Plan vs Actual Hourly` มีข้อมูลชั่วโมงละแถว (ราว 170,000 แถว/ปี) แนะนำใส่ *Extract filter* `Prod Date` ย้อนหลัง 90 วัน
    - Tableau Cloud จะส่งงาน refresh ผ่าน Bridge ให้เอง **เมื่อชื่อ Server ตรงกับ Private Network Allowlist ของ pool ที่มีเครื่อง Bridge อยู่**
 7. Certify: Tableau Cloud → *Explore → All Data Sources* → ปุ่ม … หลังชื่อ data source → **Data Labels → Certification** → ติ๊ก *Certified* → Save
    (ทำได้เฉพาะ Site Admin หรือ Creator/Explorer (can publish) ที่เป็นเจ้าของหรือ Project Leader ของ project นั้น) — ให้ทุกคนรู้ว่าตัวนี้คือตัวจริง
 8. สร้าง Dashboard โดยต่อกับ **published data source** (*Data → New Data Source → Tableau Server/Cloud*) ไม่ต่อ SQL ตรงอีก
+
+**ย้ายจากข้อมูลตัวอย่างไปข้อมูลจริง:** รัน `01 → 02 → 03 → 07 → 05` ใน `FactoryBI` ก่อน
+แล้วเปิด data source แต่ละตัวใน Tableau Desktop → แท็บ *Data Source* → เปลี่ยน Database เป็น `FactoryBI` → Publish ทับชื่อเดิม
+(Dashboard ที่ต่อกับ published data source จะเปลี่ยนตามเอง)
 
 ## ง. ข้อมูลสดแค่ไหน
 
