@@ -3,8 +3,10 @@
 สร้างใน **data source** ก่อน Publish (คลิกขวาพื้นที่ว่างในแถบ Data → *Create Calculated Field…*)
 ทุก Dashboard ที่ใช้ data source นี้จะได้สูตรเดียวกันหมด
 
-> **เรื่องชื่อคอลัมน์:** Tableau มักแปลงชื่อคอลัมน์จาก SQL ให้อ่านง่าย เช่น `run_min` → **Run Min**
-> สูตรด้านล่างเขียนตามชื่อที่แปลงแล้ว ถ้าใน Tableau ของคุณยังแสดงเป็น `run_min` ให้พิมพ์ `[` แล้วเลือกชื่อจากรายการแทน
+> **เรื่องชื่อคอลัมน์:** Tableau Desktop ที่ใช้ **เมนูภาษาอังกฤษ** จะแปลงชื่อคอลัมน์ให้อ่านง่าย เช่น `run_min` → **Run Min**
+> และคำ 2–3 ตัวอักษรที่ไม่มีสระ (a e i o u) จะเป็นตัวพิมพ์ใหญ่ เช่น `plan_qty` → **Plan QTY**, `reason_name_th` → **Reason Name TH**
+> สูตรด้านล่างเขียนตามชื่อแบบนี้ — ถ้า Tableau ใช้ **เมนูภาษาไทย** ชื่อจะไม่ถูกแปลง (ยังเป็น `run_min`) ให้เปลี่ยนเป็นภาษาอังกฤษก่อนสร้าง data source (ดูไฟล์ `01` ข้อ ค)
+> ถ้าวางสูตรแล้วชื่อฟิลด์ขึ้นสีแดง ให้ลบชื่อใน `[ ]` แล้วพิมพ์ `[` เลือกจากรายการ — คอลัมน์ที่เพิ่มเข้า view ภายหลังแล้วกด Refresh จะไม่ถูกแปลงชื่อ (Rename เองได้)
 >
 > **คอลัมน์ 0/1** เช่น *Is Shift Closed*, *Is Current Shift*, *Is Planned Stop*, *Is Scheduled*, *Shifts Ago*
 > Tableau อาจจัดเป็น Measure — คลิกขวา → **Convert to Dimension** ก่อนใช้เป็นตัวกรอง
@@ -22,8 +24,8 @@
 | `Performance` | `SUM([Ideal Run Min]) / SUM([Run Min])` |
 | `Quality` | `SUM([Good Ideal Min]) / SUM([Ideal Run Min])` |
 | `OEE` | `SUM([Good Ideal Min]) / SUM([Planned Production Min])` |
-| `Scrap %` | `SUM([Scrap Qty]) / SUM([Total Qty])` |
-| `Attainment %` | `SUM([Good Qty]) / SUM([Plan Qty Elapsed])` |
+| `Scrap %` | `SUM([Scrap QTY]) / SUM([Total QTY])` |
+| `Attainment %` | `SUM([Good QTY]) / SUM([Plan QTY Elapsed])` |
 | `Utilization` | `SUM([Good Ideal Min]) / SUM([Full Shift Planned Min])` |
 
 > ห้ามใช้ AVG ของ % — สูตรด้านบนรวมเวลาก่อนแล้วค่อยหาร เวลาดูรวมหลายเครื่อง/หลายวันจะถ่วงน้ำหนักถูกต้องเอง
@@ -87,7 +89,7 @@ END
 
 วิธีอ่าน: **Load vs Capacity % เกิน 100%** = ถ้าเครื่องทำงานได้เท่าที่ผ่านมา (OEE เท่าเดิม) จะผลิตไม่ทันแผนแน่นอน
 → ฝ่ายวางแผนย้ายงานไปเครื่องอื่น/เพิ่ม OT **หรือ** ต้องเพิ่ม OEE ของเครื่องนี้ (ดูว่าเสียเวลาที่ไหนในกราฟ "เวลาหายไปไหน")
-ถ้า `Plan Qty Missing Ct` มากกว่า 0 แปลว่ามีสินค้าในแผนที่ยังไม่มีรอบเวลามาตรฐาน — ตัวเลขจะต่ำกว่าจริง
+ถ้า `Plan QTY Missing CT` มากกว่า 0 แปลว่ามีสินค้าในแผนที่ยังไม่มีรอบเวลามาตรฐาน — ตัวเลขจะต่ำกว่าจริง
 
 ---
 
@@ -95,17 +97,17 @@ END
 
 | ชื่อฟิลด์ | สูตร | ความหมาย |
 |---|---|---|
-| `แผนทั้งกะ` | `SUM([Plan Qty])` | แผนรวมของกะ |
-| `แผนถึงตอนนี้` | `SUM([Plan Qty Elapsed])` | ควรผลิตได้เท่าไรแล้ว (นับเฉพาะชั่วโมงที่จบแล้ว/มียอดส่งเข้ามาแล้ว) |
-| `ผลิตได้` | `SUM([Actual Good Qty])` | ของดีที่ผลิตได้จริง |
+| `แผนทั้งกะ` | `SUM([Plan QTY])` | แผนรวมของกะ |
+| `แผนถึงตอนนี้` | `SUM([Plan QTY Elapsed])` | ควรผลิตได้เท่าไรแล้ว (นับเฉพาะชั่วโมงที่จบแล้ว/มียอดส่งเข้ามาแล้ว) |
+| `ผลิตได้` | `SUM([Actual Good QTY])` | ของดีที่ผลิตได้จริง |
 | `ส่วนต่าง` | `[ผลิตได้] - [แผนถึงตอนนี้]` | ติดลบ = ช้ากว่าแผน |
 | `% ตามแผน` | `[ผลิตได้] / [แผนถึงตอนนี้]` | |
 | `จำนวนเครื่อง` | `COUNTD([Machine Id])` | |
 | `ชั่วโมงที่เหลือ` | `SUM([Remaining Planned Min]) / [จำนวนเครื่อง] / 60` | ชั่วโมงที่เหลือในกะ (หักเวลาพักแล้ว) |
 | `ต้องผลิตต่อชั่วโมง` | `IF [ชั่วโมงที่เหลือ] > 0 THEN ([แผนทั้งกะ] - [ผลิตได้]) / [ชั่วโมงที่เหลือ] END` | ต้องผลิตชั่วโมงละเท่าไรถึงจะทันจบกะ |
 | `ทำได้ต่อชั่วโมง` | `[ผลิตได้] / (SUM([Reported Planned Min]) / [จำนวนเครื่อง] / 60)` | อัตราที่ทำได้จริงในกะนี้ |
-| `แผนสะสม` | `RUNNING_SUM(SUM([Plan Qty]))` | Table calculation |
-| `ผลิตสะสม` | `IF COUNT([Actual Good Qty]) > 0 THEN RUNNING_SUM(SUM([Actual Good Qty])) END` | เส้นหยุดที่ชั่วโมงปัจจุบัน |
+| `แผนสะสม` | `RUNNING_SUM(SUM([Plan QTY]))` | Table calculation |
+| `ผลิตสะสม` | `IF COUNT([Actual Good QTY]) > 0 THEN RUNNING_SUM(SUM([Actual Good QTY])) END` | เส้นหยุดที่ชั่วโมงปัจจุบัน |
 | `ส่วนต่างสะสม` | `[ผลิตสะสม] - [แผนสะสม]` | |
 | `สถานะแผน` | `IF [ส่วนต่าง] >= 0 THEN "ตามแผน" ELSEIF [% ตามแผน] >= 0.95 THEN "ช้าเล็กน้อย" ELSE "ไม่ทันแผน" END` | ใช้ระบายสี |
 
@@ -163,6 +165,6 @@ END
 
 | ชื่อฟิลด์ | สูตร |
 |---|---|
-| `Schedule Adherence %` | `SUM(IF [Shift Status] = "CLOSED" THEN [Adherence Qty] END) / SUM(IF [Shift Status] = "CLOSED" THEN [Plan Qty] END)` |
+| `Schedule Adherence %` | `SUM(IF [Shift Status] = "CLOSED" THEN [Adherence QTY] END) / SUM(IF [Shift Status] = "CLOSED" THEN [Plan QTY] END)` |
 
 **Schedule Adherence** เข้มกว่า Attainment: ผลิตสินค้า A เกินแผน ไม่ช่วยชดเชยสินค้า B ที่ขาด — เหมาะดูว่า "ผลิตตรงตามที่ลูกค้าต้องการ" หรือไม่

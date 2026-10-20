@@ -43,18 +43,19 @@ Data source: `FAC - Downtime`
 ตัวกรองหลัก: **Is Planned Stop = 0**, **Is Scheduled = 1** และ `Prod Date` → *Relative dates → Last 7 days*
 
 **ชีต 2a — Pareto**
-1. Columns: `Reason Name Th`; Rows: `นาทีหยุด` และ `Pareto % สะสม`
-2. เรียง `Reason Name Th` จากมากไปน้อยตาม `นาทีหยุด`
-3. `Pareto % สะสม` → *Compute Using → Reason Name Th* → *Dual Axis* (ไม่ต้อง Synchronize) → Mark = Line
+1. Columns: `Reason Name TH`; Rows: `นาทีหยุด` และ `Pareto % สะสม`
+2. เรียง `Reason Name TH` จากมากไปน้อยตาม `นาทีหยุด`
+3. `Pareto % สะสม` → *Compute Using → Reason Name TH* → *Dual Axis* (ไม่ต้อง Synchronize) → Mark = Line
 4. ใส่ Reference Line คงที่ 0.8 บนแกน % (เส้น 80%)
 5. ปุ่มสลับมุมมอง: สร้าง Parameter `ดูตาม` (String, รายการ: สาเหตุ / เครื่อง / กะ) + calculated field `มิติ Pareto`
-   `CASE [ดูตาม] WHEN "เครื่อง" THEN [Machine Id] WHEN "กะ" THEN [Shift Code] ELSE [Reason Name Th] END`
-   แล้วใช้ `มิติ Pareto` แทน `Reason Name Th`
+   `CASE [ดูตาม] WHEN "เครื่อง" THEN [Machine Id] WHEN "กะ" THEN [Shift Code] ELSE [Reason Name TH] END`
+   แล้วใช้ `มิติ Pareto` แทน `Reason Name TH` — **ต้องตั้งใหม่ 2 อย่าง**: (1) เรียง `มิติ Pareto` จากมากไปน้อยตาม `นาทีหยุด`
+   (2) `Pareto % สะสม` → *Compute Using → มิติ Pareto* ไม่งั้นเส้น % สะสมจะคิดตามลำดับตัวอักษร ไม่ใช่ Pareto
 
 **ชีต 2b — Timeline เครื่องหยุด (วันที่เลือก)**
 1. Columns: `Seg Start` (Exact Date, Continuous); Rows: `Machine Id`; Mark = **Gantt Bar**
 2. Size: สร้าง field `ระยะ (วัน)` = `DATEDIFF('second', [Seg Start], [Seg End]) / 86400` แล้ววางที่ Size
-3. Color: `หมวดความสูญเสีย`; Tooltip: `Reason Name Th`, `Note`, `Downtime Min`
+3. Color: `หมวดความสูญเสีย`; Tooltip: `Reason Name TH`, `Note`, `Downtime Min`
 
 **ชีต 2c — ตัวเลข** `นาทีหยุด`, `จำนวนครั้ง`, `% ไม่ระบุสาเหตุ` (เป้า < 10%), `MTTR (นาที)`
 
@@ -99,11 +100,14 @@ Rows: `Machine Id`; Columns: `Prod Date` (วัน); Mark = Square; Color: `OEE
 ## ④ จอทีวีหน้าไลน์
 
 1. Publish Dashboard ① (ใช้ data source `FAC - Plan vs Actual Hourly` แบบ **Live** ถ้าอยากได้ข้อมูลสดกว่ารายชั่วโมง)
+   **สำคัญ:** เจ้าของ workbook เปิด workbook ใน Tableau Cloud → ปุ่ม … → *Edit Data Freshness Policy…* → เลือก **Ensure data is fresh every 5 minutes** (หรือ *Always live*) → OK
+   ถ้าไม่ตั้ง Tableau Cloud จะแสดงข้อมูลที่แคชไว้ได้นานถึง 12 ชม. แม้ data source เป็น Live — คนที่เปิดจากคอม/มือถือจะเห็นตัวเลขเก่า
 2. ไลเซนส์: ใช้ **Display license** (สำหรับจอโดยเฉพาะ 1 จอ = 1 login, สิทธิ์แค่ดู) — ถามตัวแทนจำหน่ายถ้ายังไม่มี
 3. ทำ Custom View แยกไลน์ (กรอง `Line Id`) → เปิด URL ของ custom view นั้นบนจอ
 4. ให้หน้าจอโหลดข้อมูลใหม่เอง เลือกวิธีใดวิธีหนึ่ง
-   - เพิ่ม Extension **Auto Refresh** จาก Tableau Exchange ลงใน Dashboard (Site Admin ต้องอนุญาต extension ก่อน)
-   - หรือใช้เบราว์เซอร์/ส่วนเสริม auto-reload ทุก 5 นาที และเติม `?:refresh=yes` ท้าย URL
+   - เพิ่ม Extension **Auto Refresh** จาก Tableau Exchange ลงใน Dashboard (เป็น Sandboxed extension รันได้เลยโดยค่าเริ่มต้น)
+     แต่จอทีวีจะมีหน้าต่างถามอนุญาต extension → ให้ Site Admin ไป *Settings → Extensions* เพิ่ม URL ของ Auto Refresh ใน safe list และตั้ง **User prompts = Hide** จอจะแสดงผลเองโดยไม่ต้องกด
+   - หรือใช้เบราว์เซอร์/ส่วนเสริม auto-reload ทุก 5 นาที และเติม `:refresh=yes` ท้าย URL (ถ้า URL มี `?` อยู่แล้ว เช่น `?:iid=1` ให้ต่อด้วย `&:refresh=yes` ถ้ายังไม่มี ให้ต่อด้วย `?:refresh=yes`)
 5. ใช้มินิพีซี/สมาร์ททีวี เปิดเบราว์เซอร์โหมดเต็มจอ (kiosk) ปิด sleep
 6. **ทดสอบ 2–3 วันก่อนติดตั้งจริง** ว่า login ไม่หลุด (Tableau Cloud บังคับยืนยันตัวตนหลายขั้น/MFA และ session มีวันหมดอายุ)
 
@@ -126,6 +130,9 @@ Rows: `Machine Id`; Columns: `Prod Date` (วัน); Mark = Square; Color: `OEE
 - ตัวกรองที่คลิกเลือกเองชั่วคราว **ไม่ติดไปกับอีเมล** — ต้องบันทึกเป็น Custom View ก่อน
 - เปิด PDF ฉบับแรกดูว่า **ภาษาไทยแสดงถูก**
 - อีเมลถูกส่งต่อได้ อย่าใส่ข้อมูลต้นทุน/กำไรในรายงานที่ส่งอีเมล
+- คนที่ subscribe ให้คนอื่นได้ ต้องเป็นเจ้าของ workbook, Project Leader หรือ Site Admin
+- อีเมล subscription ใหญ่ได้ไม่เกิน 2 MB ถ้าผู้รับไม่ได้รับ ให้เปลี่ยน Format เป็น PDF อย่างเดียว
+- เวลาส่ง (08:30) อิงจาก *My Account Settings → Time zone for scheduled tasks* ของคนที่ตั้ง — ต้องเป็น Bangkok (ดูไฟล์ `01` ข้อ ข.6)
 
 ---
 
@@ -141,18 +148,27 @@ Rows: `Machine Id`; Columns: `Prod Date` (วัน); Mark = Square; Color: `OEE
 
 ขั้นตอน: Publish ชีต → เปิดใน Tableau Cloud → **Watch → Alerts → Create** → ตั้งเงื่อนไข ความถี่ และผู้รับ → ติ๊ก *Make visible to others* ให้คนอื่นกดรับได้
 แจ้งเตือนทำงานตามรอบ refresh (ประมาณทุกชั่วโมง) — **ไม่ใช่สัญญาณเตือนฉุกเฉิน**
-ช่องทาง: อีเมล / แจ้งเตือนใน Tableau / Tableau Mobile (ส่งเข้า LINE ตรง ๆ ไม่ได้ เพราะ LINE Notify ปิดบริการแล้ว)
+ช่องทาง: อีเมล / กระดิ่งแจ้งเตือนในเว็บ Tableau / Slack (ถ้า Site Admin เชื่อม Tableau for Slack)
+ถ้าต้องการแจ้งเตือนเข้ามือถือ ให้ตั้ง Threshold ใน Pulse metric (⑦) แล้วกด Follow ในแอป Tableau Mobile (ส่งเข้า LINE ตรง ๆ ไม่ได้ เพราะ LINE Notify ปิดบริการแล้ว)
 
 ---
 
 ## ⑦ Tableau Pulse สำหรับผู้บริหาร (มีใน Tableau Cloud ทุกรุ่น)
 
-Tableau Cloud → **Pulse** → *New Metric Definition* → เลือก data source `FAC - OEE by Shift`
-- ตัวชี้วัดแนะนำ: `Good Qty` (ยอดของดี), `OEE`, `Attainment %`, `Unplanned Downtime Min`
-- Time dimension: `Prod Date`; ให้ Pulse วิเคราะห์ตาม `Line Id`, `Machine Id`, `Shift Code`
-- **Filters: Is Shift Closed = 1** (ไม่งั้นกะที่ยังเดินอยู่จะทำให้ตัวเลขวันนี้ดูตก)
-- ตั้งทิศทาง: OEE / ยอดผลิต ยิ่งสูงยิ่งดี, เวลาหยุด ยิ่งต่ำยิ่งดี
-ผู้บริหารกด *Follow* แล้วจะได้สรุปอัตโนมัติทางอีเมล/มือถือ (รองรับภาษาไทย)
+0. Site Admin เปิดก่อน (ค่าเริ่มต้นปิด): *Settings → Tableau Pulse → Deployment → Turn on Tableau Pulse*
+   ถ้าต้องการสรุปด้วย AI: *Settings → General → AI in Tableau → Tableau Pulse* (ค่าเริ่มต้นปิดเช่นกัน)
+   คนสร้าง Metric Definition ต้องเป็น Creator / Explorer (can publish) / Site Admin Explorer
+1. Tableau Cloud → **Pulse** → *New Metric Definition* → เลือก data source `FAC - OEE by Shift`
+2. ตัวชี้วัด
+   - `Good QTY`, `Unplanned Downtime Min`: เลือกที่ Measure + Aggregation = Sum ได้เลย
+   - `OEE`, `Attainment %` เป็นสัดส่วน (SUM ÷ SUM) → กด **Create Advanced Definition** ลากฟิลด์ `OEE` (หรือ `Attainment %`) ไปที่ Measure → Apply
+     ตั้ง Number format = Percentage และให้ค่าแสดงแบบไม่สะสม (non-cumulative)
+3. Time dimension: `Prod Date`; Adjustable metric filters: `Line Id`, `Machine Id`, `Shift Code`
+4. Definition filters: **Is Shift Closed = 1** (ไม่งั้นกะที่ยังเดินอยู่จะทำให้ตัวเลขวันนี้ดูตก)
+5. Time → **Date offset = 1 day** (วันนี้ยังไม่มีกะที่ปิดครบ ถ้าไม่ตั้ง ค่าล่าสุดจะว่าง)
+6. ทิศทาง: OEE / Good QTY ขึ้น = ดี, Unplanned Downtime Min ขึ้น = ไม่ดี
+
+ผู้บริหารกด *Follow* แล้วจะได้สรุปทางอีเมล (และ Slack/Teams ถ้าเชื่อมไว้) และแจ้งเตือน push ในแอป Tableau Mobile (รองรับภาษาไทย)
 
 ---
 
