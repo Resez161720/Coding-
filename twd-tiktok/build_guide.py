@@ -163,50 +163,59 @@ def bar(start, dur):
                  r"{\pos(140,1110)\p1\fscx100\t(0," + str(ms) + r",\fscx0)}m 0 0 l 800 0 800 10 0 10{\p0}")
 
 
+def timeline(sections):
+    """เวลาของทุกท่อนในวิดีโอนำพากย์ เรียงตามลำดับ: [(si, ci, text, start, dur)]
+    คืนค่าเวลาที่ท่อนสุดท้ายจบด้วย build_part.py ใช้ค่านี้เทียบกับเสียงที่อัดตามวิดีโอนี้"""
+    rows, t = [], float(COUNTDOWN)
+    for si, sec in enumerate(sections):
+        t += SECTION_CARD
+        for ci, text in enumerate(chunk(sec["narration"])):
+            d = chunk_duration(text)
+            rows.append((si, ci, text, t, d))
+            t += d
+    return rows, t
+
+
 def build():
     sections = parse_sections()
+    rows, t_end = timeline(sections)
     events, chapters = [], []
-    t = 0.0
 
-    first = chunk(sections[0]["narration"])[0]
-    for n in range(COUNTDOWN, 0, -1):
-        events.append(event(t, t + 1, "Card", r"{\pos(540,860)}" + str(n)))
-        t += 1
-    events.append(event(0, t, "Header", "เตรียมพากย์"))
-    events.append(event(0, t, "Label", r"{\pos(540,1210)}ท่อนแรก"))
-    events.append(event(0, t, "Next", next_text(first)))
+    for n in range(COUNTDOWN):
+        events.append(event(n, n + 1, "Card", r"{\pos(540,860)}" + str(COUNTDOWN - n)))
+    events.append(event(0, COUNTDOWN, "Header", "เตรียมพากย์"))
+    events.append(event(0, COUNTDOWN, "Label", r"{\pos(540,1210)}ท่อนแรก"))
+    events.append(event(0, COUNTDOWN, "Next", next_text(rows[0][2])))
 
-    for si, sec in enumerate(sections):
-        chunks = chunk(sec["narration"])
-        sec_start = t
-        chapters.append((sec_start, sec["title"]))
+    for k, (si, ci, text, t, d) in enumerate(rows):
+        sec = sections[si]
+        if ci == 0:
+            card = t - SECTION_CARD
+            chapters.append((card, sec["title"]))
+            events.append(event(card, t, "Card", main_text(sec["title"])))
+            events.append(event(card, t, "Label", r"{\pos(540,1210)}ท่อนแรก"))
+            events.append(event(card, t, "Next", next_text(text)))
+            events.append(bar(card, SECTION_CARD))
 
-        events.append(event(t, t + SECTION_CARD, "Card", main_text(sec["title"])))
-        events.append(event(t, t + SECTION_CARD, "Label", r"{\pos(540,1210)}ท่อนแรก"))
-        events.append(event(t, t + SECTION_CARD, "Next", next_text(chunks[0])))
-        events.append(bar(t, SECTION_CARD))
-        t += SECTION_CARD
+        events.append(event(t, t + d, "Main", main_text(text)))
+        events.append(bar(t, d))
+        if k + 1 == len(rows):
+            nxt = "จบ"
+        elif rows[k + 1][0] != si:
+            nxt = "▸ " + sections[rows[k + 1][0]]["title"]
+        else:
+            nxt = rows[k + 1][2]
+        events.append(event(t, t + d, "Label", r"{\pos(540,1210)}ถัดไป"))
+        events.append(event(t, t + d, "Next", next_text(nxt)))
 
-        for ci, text in enumerate(chunks):
-            d = chunk_duration(text)
-            events.append(event(t, t + d, "Main", main_text(text)))
-            events.append(bar(t, d))
-            if ci + 1 < len(chunks):
-                nxt = chunks[ci + 1]
-            elif si + 1 < len(sections):
-                nxt = "▸ " + sections[si + 1]["title"]
-            else:
-                nxt = "จบ"
-            events.append(event(t, t + d, "Label", r"{\pos(540,1210)}ถัดไป"))
-            events.append(event(t, t + d, "Next", next_text(nxt)))
-            t += d
+        if k + 1 == len(rows) or rows[k + 1][0] != si:
+            sec_start = chapters[-1][0]
+            events.append(event(sec_start, t + d, "Header", sec["title"]))
+            if sec["scene"]:
+                events.append(event(sec_start, t + d, "Scene", scene_text(sec["scene"])))
 
-        events.append(event(sec_start, t, "Header", sec["title"]))
-        if sec["scene"]:
-            events.append(event(sec_start, t, "Scene", scene_text(sec["scene"])))
-
-    events.append(event(t, t + END_CARD, "Card", r"{\pos(540,860)}จบ"))
-    t += END_CARD
+    events.append(event(t_end, t_end + END_CARD, "Card", r"{\pos(540,860)}จบ"))
+    t = t_end + END_CARD
 
     OUT_DIR.mkdir(exist_ok=True)
     ASS_FILE.write_text(ASS_HEADER + "\n".join(events) + "\n", encoding="utf-8")
