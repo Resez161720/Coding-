@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """ตัดต่อคลิป TikTok หนึ่งพาร์ทจากเสียงพากย์ที่อัดตามวิดีโอนำพากย์
 
-ใช้: python3 build_part.py <เลขพาร์ท> <ไฟล์เสียง>
+ใช้: python3 build_part.py <เลขพาร์ท> <ไฟล์เสียง> [ไฟล์หนังสำหรับภาพประกอบ]
 ผลลัพธ์ใน part<N>/: twd_part<N>.mp4, voice_part<N>_clean.m4a, part<N>.srt
+ถ้าไม่ใส่ไฟล์หนัง พื้นหลังจะเป็นสีเข้มอย่างเดียว (ไฟล์หนังดาวน์โหลดได้จาก FILM["url"])
 
 ขั้นตอน
 1. หาช่วงที่มีเสียงพูดจากระดับเสียง แล้วจับคู่จุดเริ่มพูดแต่ละช่วงกับท่อนในสคริปต์
@@ -43,8 +44,64 @@ PARTS = {
             ("EndSmall", "เรือนจำ · The Governor · Terminus"),
             ("EndText", "กดติดตามไว้ ไม่พลาดตอนต่อไป"),
         ],
+        # ภาพประกอบจาก FILM: (ท่อนที่เริ่มใช้ภาพนี้, เวลาในหนัง, ตำแหน่งครอปแนวนอน 0–1)
+        # เวลาในหนังเป็นวินาทีเดียว (หาขอบเขตช็อตอัตโนมัติ) หรือ (เริ่ม, จบ) เมื่อต้องกำหนดช่วงเอง
+        # ภาพนี้แสดงจนถึงท่อนของภาพถัดไป "END" คือพื้นหลังการ์ดท้ายคลิป
+        # เลือกเฉพาะช็อตที่ไม่มีเลือด การทำร้าย หรือภาพเปลือยให้เห็น ช็อตที่อยู่ติดกับฉากแบบนั้น
+        # กำหนดช่วงเองทุกครั้ง เพราะการหาจุดตัดฉากอัตโนมัติพลาดได้ในฉากมืด
+        "broll": [
+            ("ซีรีส์ซอมบี้ที่ฉายยาวถึง", 4338, 0.5),      # ฝูงซอมบี้เดินเข้าหากล้องตอนกลางคืน
+            ("มีทั้งหมด 177 ตอน", 765, 0.5),              # หน้าซอมบี้ในความมืด
+            ("แต่ตัวละครที่คนรักที่สุด", 4298, 0.5),       # ฝูงซอมบี้กลางทุ่ง
+            ("กลับไม่มีอยู่ในคอมิก", 720, 0.4),            # ซอมบี้ข้างบ้าน
+            ("The Walking Dead ซีรีส์ของช่อง", 3362, 0.5),  # โทรทัศน์
+            ("ดัดแปลงมาจากคอมิก", 525, 0.5),             # ถนนชนบท
+            ("ตอนแรกออกฉายคืนฮาโลวีน", 245, 0.5),         # สุสาน
+            ("และจบในปี 2022", 1005, 0.5),                # ไฟหน้ารถกลางคืน
+            ("วันนี้จะสรุปให้ฟัง", 2085, 0.6),              # กองไฟกลางคืน
+            ("ตั้งแต่ซีซั่น 1", 4470, 0.5),                 # ซอมบี้เดินเข้าหากองไฟ
+            ("รองนายอำเภอ Rick", 5475, 0.5),              # ตำรวจกับสุนัขกลางทุ่ง
+            ("ตื่นจากโคม่า", 645, 0.5),                    # ห้องว่างในบ้านร้าง
+            ("โลกที่เขาเคยรู้จัก", (2772.9, 2775.4), 0.5),   # ฝูงซอมบี้กลางทุ่งตอนกลางคืน
+            ("เขาตามหาครอบครัว", (5516.4, 5521.8), 0.6),   # รถแล่นบนถนนลูกรัง
+            ("ทั้งคู่อยู่กับ Shane", 1170, 0.5),           # บ้านตอนกลางคืน
+            ("แต่สิ่งที่ Rick ไม่รู้", (4063.98, 4065.8), 0.5),  # ตอกไม้ปิดประตู (ก่อนตัดไปหน้านักแสดง)
+            ("ระหว่างที่เขาโคม่า", 5370, 0.5),             # ต้นไม้ตัดกับท้องฟ้า
+            ("และ Shane กับ Lori", (5375.3, 5378.4), 0.5),  # กิ่งไม้ตัดกับดวงอาทิตย์
+            ("กลุ่มหนีไปถึงศูนย์ควบคุมโรค", 3540, 0.5),    # ข่าวเจ้าหน้าที่ที่วอชิงตัน
+            ("และก่อนตึกจะระเบิด", 4321, 0.5),            # รถระเบิดเป็นไฟ
+            ("หมอคนสุดท้ายที่นั่น", 3422, 0.5),            # ผู้ประกาศข่าว
+            ("กระซิบความลับ", 2428, 0.5),                # หน้าปัดวิทยุ
+            ("Sophia ลูกสาวของ Carol", 540, 0.5),         # ป่า
+            ("Carl ถูกยิง", 5400, 0.4),                   # ชายถือปืนไรเฟิล
+            ("กลุ่มต้องไปพักที่ฟาร์ม", 585, 0.55),          # บ้านไร่
+            ("และค้นหา Sophia", 5580, 0.5),               # กลุ่มคนค้นหากลางทุ่ง
+            ("จนเปิดประตูโรงนา", 4245, 0.7),              # โรงนา
+            ("แล้วพบว่า Sophia", 3150, 0.5),              # เด็กหญิงนอนป่วย
+            ("กลายเป็นซอมบี้อยู่ในนั้น", (5097.75, 5098.65), 0.5),  # เด็กหญิงที่กลายเป็นซอมบี้ (ก่อนฉากทำร้าย)
+            ("ส่วน Rick กับ Shane", (4404.4, 4408.2), 0.5),  # ต่อสู้ (ภาพเบลอ ไม่เห็นหน้า)
+            ("จน Rick ต้องฆ่า", (4424.9, 4426.3), 0.5),     # ต่อสู้ (ภาพเบลอ)
+            ("แล้วเขาก็บอกทุกคนว่า", 3375, 0.5),           # โทรทัศน์ในห้อง
+            ("หมอที่ CDC กระซิบ", 3436, 0.5),            # ผู้ประกาศข่าว
+            ("ทุกคนติดเชื้ออยู่แล้ว", 1123, 0.4),          # ฝูงซอมบี้เดินตอนกลางคืน
+            ("ไม่ว่าจะตายด้วยสาเหตุอะไร", (1063.8, 1065.8), 0.5),  # ร่างบนสนามหญ้าตอนกลางคืน
+            ("ก็จะลุกขึ้นมาเป็นซอมบี้", 780, 0.5),          # ซอมบี้เดินเข้ามา
+            ("END", (2775.4, 2777.6), 0.5),              # ฝูงซอมบี้ (เบลอ มืด) ช็อตถัดไปมีภาพเปลือย
+        ],
     },
 }
+
+# หนังที่ใช้ทำภาพประกอบ เป็นสาธารณสมบัติในสหรัฐฯ (ไม่มีประกาศลิขสิทธิ์ตามกฎหมายปี 1909)
+# เวลาใน "broll" อ้างอิงไฟล์นี้จาก Internet Archive
+FILM = {
+    "url": "https://archive.org/download/Night.Of.The.Living.Dead_1080p/NightOfTheLivingDead_PS3.mp4",
+    "picture": "crop=1440:1080:240:0",     # ตัดขอบดำซ้ายขวาออก เหลือภาพ 4:3
+    "credit": "ภาพประกอบ: Night of the Living Dead (1968) · สาธารณสมบัติ",
+}
+FPS = 30
+MAX_SLOWMO = 2.5          # ถ้าช็อตสั้นกว่าเวลาที่ต้องใช้ ยืดได้ไม่เกินกี่เท่า
+BROLL_LOOK = "eq=contrast=1.12:brightness=-0.07:saturation=0,drawbox=color=black@0.3:t=fill"
+END_LOOK = "eq=contrast=1.05:brightness=-0.12:saturation=0,gblur=sigma=10,drawbox=color=black@0.4:t=fill"
 
 SR = 16000
 HOP = 160                 # 10 ms
@@ -162,6 +219,54 @@ def keep_segments(regions, start, end):
     return segs
 
 
+def shot_bounds(film, t, before=8.0, after=10.0):
+    """ช่วงเวลาของช็อตในหนังที่มีวินาที t อยู่ หาจากจุดตัดฉาก"""
+    start = max(0.0, t - before)
+    log = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-t", f"{before + after:.3f}",
+         "-i", str(film), "-an", "-vf", f"{FILM['picture']},scale=320:-2,"
+         "select='gt(scene,0.22)',showinfo", "-f", "null", "-"],
+        capture_output=True, text=True).stderr
+    cuts = [start + float(x) for x in re.findall(r"pts_time:([\d.]+)", log)]
+    return (max([c for c in cuts if c <= t] or [start]),
+            min([c for c in cuts if c > t] or [start + before + after]))
+
+
+def render_broll(film, plan, out_path, tmp):
+    """plan: [(ภาพเริ่มที่เฟรม, จบที่เฟรม, วินาทีในหนัง, ครอป, ใช่การ์ดท้ายไหม)] ต่อกันเป็นวิดีโอเดียว"""
+    files, report = [], []
+    for i, (f0, f1, t, frac, is_end) in enumerate(plan):
+        need = (f1 - f0) / FPS
+        if isinstance(t, tuple):
+            (s0, s1), margin, anchor = t, 0.0, (t[0] + t[1]) / 2
+        else:
+            (s0, s1), margin, anchor = shot_bounds(film, t), 0.06, t
+        usable = s1 - s0 - 2 * margin
+        if usable >= need:
+            speed = 1.0
+            src = min(max(anchor - need / 2, s0 + margin), s1 - margin - need)
+        else:
+            speed = min(need / usable, MAX_SLOWMO)
+            src = s0 + margin
+        x = round((2560 - 1080) * frac)
+        look = END_LOOK if is_end else BROLL_LOOK
+        clip = Path(tmp) / f"clip{i:03d}.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{src:.3f}",
+             "-t", f"{need / speed + 0.5:.3f}", "-i", str(film), "-an",
+             "-vf", f"{FILM['picture']},scale=2560:1920,crop=1080:1920:{x}:0,"
+                    f"setpts=(PTS-STARTPTS)*{speed:.4f},fps={FPS},{look},format=yuv420p",
+             "-frames:v", str(f1 - f0), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+             str(clip)], check=True)
+        files.append(clip)
+        report.append((f0 / FPS, t, src, need / speed, speed))
+    listing = Path(tmp) / "clips.txt"
+    listing.write_text("".join(f"file '{f}'\n" for f in files))
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                    "-i", str(listing), "-c", "copy", str(out_path)], check=True)
+    return report
+
+
 def to_output(t, segs):
     acc = 0.0
     for a, b in segs:
@@ -203,6 +308,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Title,Loma,66,&H003030E0,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,6,0,1,3,0,5,0,0,0,1
 Style: Label,Loma,38,&H00A0A0A0,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,0,0,0,1
+Style: Credit,Loma,26,&H00909090,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,0,0,0,1
 Style: Badge,Loma,40,&H00FFFFFF,&H00FFFFFF,&H002828C8,&H00000000,1,0,0,0,100,100,0,0,3,12,0,5,0,0,0,1
 Style: Caption,Loma,86,&H00FFFFFF,&H00FFFFFF,&H001A1A8A,&H00000000,1,0,0,0,100,100,0,0,1,5,0,5,60,60,0,1
 Style: Banner,Loma,60,&H0040D8FF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,0,5,60,60,0,1
@@ -218,7 +324,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 POP = r"\fad(60,0)\fscx92\fscy92\t(0,140,\fscx100\fscy100)"
 
 
-def build(part_no, voice_path):
+def build(part_no, voice_path, film=None):
     cfg = PARTS[part_no]
     out_dir = HERE / f"part{part_no}"
     out_dir.mkdir(exist_ok=True)
@@ -335,6 +441,10 @@ def build(part_no, voice_path):
             end = caps[end_k][3]
         events.append(ev(caps[k][2], end, "Banner", r"{\pos(540,1240)" + POP + "}" + text))
 
+    use_broll = film is not None and "broll" in cfg
+    if use_broll:
+        events.append(ev(0, total, "Credit", r"{\pos(540,385)}" + FILM["credit"]))
+
     y = 640
     step = {"EndBig": 120, "EndText": 80, "EndGap": 90, "EndNext": 100, "EndSmall": 70}
     for i, (style, text) in enumerate(cfg["end_card"]):
@@ -351,17 +461,36 @@ def build(part_no, voice_path):
 
     # ---- วิดีโอ ----
     video = out_dir / f"twd_part{part_no}.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-         "-f", "lavfi", "-i", f"color=c=0x0e0e0e:s=1080x1920:r=30:d={total:.2f}",
-         "-i", clean_m4a.name,
-         "-filter_complex", f"[0:v]noise=alls=10:allf=u,vignette=PI/4,ass={ass.name}[vid];"
-                            f"[1:a]apad=whole_dur={total:.2f}[aud]",
-         "-map", "[vid]", "-map", "[aud]", "-t", f"{total:.2f}",
-         "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", video.name],
-        cwd=out_dir, check=True,
-    )
+    with tempfile.TemporaryDirectory() as tmp:
+        broll_report = []
+        if use_broll:
+            frame = lambda t: round(t * FPS)
+            starts = []
+            for key, t, frac in cfg["broll"]:
+                if key == "END":
+                    starts.append((frame(voice_len), t, frac, True))
+                else:
+                    c = next(c for c in caps if c[1].startswith(key))
+                    starts.append((0 if not starts else frame(c[2]), t, frac, False))
+            ends = [s[0] for s in starts[1:]] + [frame(total)]
+            plan = [(f0, f1, t, frac, is_end) for (f0, t, frac, is_end), f1 in zip(starts, ends)]
+            base = Path(tmp) / "broll.mp4"
+            broll_report = render_broll(film, plan, base, tmp)
+            video_in = ["-i", str(base)]
+            look = "noise=alls=6:allf=u"
+        else:
+            video_in = ["-f", "lavfi", "-i", f"color=c=0x0e0e0e:s=1080x1920:r={FPS}:d={total:.2f}"]
+            look = "noise=alls=10:allf=u"
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *video_in,
+             "-i", clean_m4a.name,
+             "-filter_complex", f"[0:v]{look},vignette=PI/4,ass={ass.name}[vid];"
+                                f"[1:a]apad=whole_dur={total:.2f}[aud]",
+             "-map", "[vid]", "-map", "[aud]", "-t", f"{total:.2f}",
+             "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", video.name],
+            cwd=out_dir, check=True,
+        )
 
     print(f"{video}  {total:.1f}s (เสียงพากย์ {voice_len:.1f}s + การ์ดท้าย {END_CARD:.0f}s)")
     print(f"ความดัง {final_lufs:.1f} LUFS, true peak {final_peak:.1f} dBFS")
@@ -370,7 +499,13 @@ def build(part_no, voice_path):
     for k, (si, text, a, b) in enumerate(caps):
         flag = "" if picks[k] is not None else "  (ประมาณจากเวลาในวิดีโอนำพากย์)"
         print(f"  {a:6.2f}-{b:6.2f}  {text}{flag}")
+    if broll_report:
+        print("ภาพประกอบ (เวลาในคลิป ← วินาทีในหนัง, ความเร็ว):")
+        for at, t, src, dur, speed in broll_report:
+            slow = f"  slow-mo x{speed:.2f}" if speed > 1 else ""
+            print(f"  {at:6.2f}s ← {src:7.2f}–{src + dur:7.2f}s (เลือกไว้ {t}){slow}")
 
 
 if __name__ == "__main__":
-    build(int(sys.argv[1]), Path(sys.argv[2]).resolve())
+    film = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else None
+    build(int(sys.argv[1]), Path(sys.argv[2]).resolve(), film)
