@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ระบบช่วยพิมพ์ Tag</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>ระบบช่วยพิมพ์ Tag</h1>
+    <span id="mode" class="badge"></span>
+    <span id="worker-state" class="worker-state"></span>
+  </header>
+
+  <main>
+    <div id="offline" class="alert" hidden>ติดต่อโปรแกรมไม่ได้ เปิดหน้าต่างโปรแกรม (หน้าต่างสีดำ) ไว้หรือเปล่า</div>
+    <div id="master-error" class="alert" hidden></div>
+
+    <section class="panel">
+      <h2>1. นำเข้าข้อมูลจากเครื่องยิง</h2>
+      <p class="hint">คลิกในช่องด้านล่าง แล้วสั่งส่งข้อมูลจากเครื่องยิง ข้อมูลจะพิมพ์ลงมาเอง จากนั้นกด "นำเข้า"</p>
+      <textarea id="scan-text" rows="6" spellcheck="false" autofocus placeholder="ข้อมูลจากเครื่องยิงจะขึ้นที่นี่ บรรทัดละ 1 barcode"></textarea>
+      <div class="row">
+        <button id="import" class="primary">นำเข้า</button>
+        <button id="clear">ล้าง</button>
+        <button id="sample" hidden>ใส่ข้อมูลตัวอย่าง (โหมดทดลอง)</button>
+      </div>
+      <div id="import-result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>2. พิมพ์ทีละสี</h2>
+      <div id="groups" class="groups"></div>
+      <div id="needs-color"></div>
+      <div class="row">
+        <button id="stop" class="danger" disabled>หยุดหลังใบนี้</button>
+        <span id="worker-message" class="worker-message"></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>3. รายการ</h2>
+      <div class="tabs" id="tabs">
+        <button data-filter="todo" class="active">ต้องจัดการ <span id="count-todo"></span></button>
+        <button data-filter="pending">รอพิมพ์ <span id="count-pending"></span></button>
+        <button data-filter="done">พิมพ์แล้ววันนี้ <span id="count-done"></span></button>
+        <button data-filter="all">ทั้งหมด</button>
+      </div>
+      <div class="table-wrap">
+        <table id="requests">
+          <thead>
+            <tr>
+              <th>#</th><th>สถานะ</th><th>สี</th><th>เครื่อง</th><th>ใบสั่งงาน</th><th>รถเข็น</th>
+              <th>จำนวน</th><th>NG</th><th>พนักงาน</th><th>ดาย</th><th>D/O</th><th>Coil</th>
+              <th>Lot ใหม่</th><th>หมายเหตุ</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="empty" class="hint" hidden>ไม่มีรายการ</p>
+    </section>
+  </main>
+
+  <footer>
+    <a href="/cards" target="_blank">พิมพ์การ์ด barcode</a>
+    <button id="dump" class="link">บันทึกหน้าจอเขียว (ส่งให้ผู้พัฒนา)</button>
+    <button id="reload" class="link">โหลดตารางข้อมูลใหม่</button>
+  </footer>
+
+  <dialog id="question">
+    <h2 id="q-title"></h2>
+    <p id="q-message" class="q-message"></p>
+    <pre id="q-screen" hidden></pre>
+    <div class="row">
+      <button id="q-yes" class="primary big"></button>
+      <button id="q-no" class="big"></button>
+    </div>
+  </dialog>
+
+  <dialog id="editor">
+    <h2>แก้ไขรายการ <span id="e-id"></span></h2>
+    <form id="editor-form" method="dialog">
+      <label>เครื่อง <input name="machine"></label>
+      <label>ใบสั่งงาน <input name="work_order"></label>
+      <label>D/O (Remark 1) <input name="mat_do"></label>
+      <label>Coil (Remark 3) <input name="mat_coil"></label>
+      <label>ดาย <input name="die"></label>
+      <label>รหัสพนักงาน <input name="emp"></label>
+      <label>รถเข็น <input name="cart"></label>
+      <label>จำนวนดี <input name="qty" inputmode="numeric" placeholder="เว้นว่าง = เต็มตะกร้า"></label>
+      <label>NG <input name="ng" inputmode="numeric"></label>
+      <p id="e-error" class="error"></p>
+      <div class="row">
+        <button value="save" class="primary">บันทึก</button>
+        <button value="cancel" formnovalidate>ปิด</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

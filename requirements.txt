@@ -1,0 +1,2 @@
+# ใช้งานจริงบน Windows (ต่อจอเขียว)
+pywin32>=306; sys_platform == "win32"
